@@ -1,4 +1,5 @@
 export const SECURE_TRANSFER_CONTRACT = 1 as const;
+export const SECURE_TRANSFER_REPLACEMENT_CONTRACT = 1 as const;
 export const SECURE_TRANSFER_REVOCATION_CONTRACT = 1 as const;
 export const SECURE_TRANSFER_UPLOAD_RECEIPT_CONTRACT = 1 as const;
 
@@ -126,6 +127,9 @@ export type SecureTransferByteRange = {
 export type SecureTransferRevocationReason =
   "access-revoked" | "member-removed" | "superseded" | "user-request";
 
+export type SecureTransferReplacementReason =
+  "device-recovery" | "manual-rotation" | "membership-change" | "self-update";
+
 /**
  * An immutable revocation notice intended for authenticated E2EE delivery.
  * It prevents future cooperating-client fetches; it cannot recall copied keys,
@@ -138,6 +142,25 @@ export type SecureTransferRevocation = {
   readonly revokerDeviceId: string;
   readonly transferId: string;
   readonly reason?: SecureTransferRevocationReason;
+};
+
+/** One MLS application payload: install the fresh descriptor and supersede old. */
+export type SecureTransferReplacement = {
+  readonly contract: typeof SECURE_TRANSFER_REPLACEMENT_CONTRACT;
+  readonly reason: SecureTransferReplacementReason;
+  readonly replacementDescriptor: SecureTransferDescriptor;
+  readonly securityEpoch: number;
+  readonly supersession: SecureTransferRevocation & {
+    readonly reason: "superseded";
+  };
+};
+
+/** Structural subset of an authenticated secure-messaging application context. */
+export type SecureTransferReplacementAuthenticatedContext = {
+  readonly conversationId: string;
+  readonly purpose: "secure-transfer.replacement";
+  readonly securityEpoch: number;
+  readonly senderId: string;
 };
 
 export type SecureTransferRevocationStore = {
@@ -315,6 +338,20 @@ export type SecureTransferRangeSink = {
 };
 
 export type SecureTransferClient = {
+  readonly activateReplacement: (input: {
+    readonly authenticatedContext: SecureTransferReplacementAuthenticatedContext;
+    /** Must durably and idempotently protect the new bearer descriptor. */
+    readonly persistReplacement: (
+      descriptor: SecureTransferDescriptor,
+    ) => Promise<void>;
+    readonly previousDescriptor: SecureTransferDescriptor;
+    /** Sender-side cleanup only; recipients normally leave this false. */
+    readonly removeSupersededCiphertext?: boolean;
+    readonly replacement: SecureTransferReplacement;
+  }) => Promise<{
+    readonly ciphertextRemoved?: boolean;
+    readonly revocation: "created" | "exists";
+  }>;
   /** Apply only after the E2EE sender is authenticated and authorized to revoke. */
   readonly applyRevocation: (input: {
     readonly descriptor: SecureTransferDescriptor;
@@ -333,6 +370,12 @@ export type SecureTransferClient = {
     sink: SecureTransferRangeSink,
   ) => Promise<void>;
   readonly remove: (descriptor: SecureTransferDescriptor) => Promise<void>;
+  readonly prepareReplacement: (input: {
+    readonly previousDescriptor: SecureTransferDescriptor;
+    readonly reason: SecureTransferReplacementReason;
+    readonly replacement: SecureTransferUploadInput;
+    readonly securityEpoch: number;
+  }) => Promise<SecureTransferReplacement>;
   readonly revoke: (input: {
     readonly descriptor: SecureTransferDescriptor;
     readonly reason?: SecureTransferRevocationReason;

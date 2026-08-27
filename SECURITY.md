@@ -24,6 +24,14 @@ Only apply a received notice after the E2EE sender identity and revocation
 authority have been verified. Deleting ciphertext or key material cannot erase
 copies already held by a recipient.
 
+After membership removal, old attachment capabilities remain usable until their
+ciphertext expires or is removed. Send the fresh descriptor and its supersession
+notice as one `secure-transfer.replacement` MLS application message bound to the
+expected new epoch. Persist the new protected descriptor before installing the
+old tombstone. Rotation sources expose plaintext at the endpoint; never route
+them through a model or server that is outside the declared confidentiality
+boundary. Rate-limit replacement work to resist membership-churn abuse.
+
 Decryption proves record authenticity, not file safety. Treat filenames and
 content types as untrusted, do not render active content inline by default, and
 inspect decrypted files before parsing or executing them.

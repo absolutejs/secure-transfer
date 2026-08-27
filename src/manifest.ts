@@ -17,6 +17,7 @@ export const manifest = defineManifest<{
       "resume an encrypted upload without reusing an AEAD nonce",
       "download an authenticated plaintext byte range",
       "revoke future attachment fetches with an E2EE policy tombstone",
+      "replace an attachment capability after an MLS membership change",
     ],
     keywords: [
       "secure transfer",
@@ -26,6 +27,7 @@ export const manifest = defineManifest<{
       "untrusted storage",
       "attachment revocation",
       "range download",
+      "capability rotation",
     ],
     protocols: ["RFC 8188-inspired authenticated records"],
   },

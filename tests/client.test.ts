@@ -3,9 +3,11 @@ import {
   SECURE_TRANSFER_CONTRACT,
   createSecureTransferClient,
   decodeSecureTransferDescriptor,
+  decodeSecureTransferReplacement,
   decodeSecureTransferRevocation,
   decodeSecureTransferUploadReceipt,
   encodeSecureTransferDescriptor,
+  encodeSecureTransferReplacement,
   encodeSecureTransferRevocation,
   encodeSecureTransferUploadReceipt,
   SecureTransferResumeUnsafeError,
@@ -19,6 +21,8 @@ import {
 
 const createSurface = (useDefaultIdFactories = false) => {
   let currentTime = 1_000;
+  let capabilityId = 41;
+  let transferId = 0;
   let failPutRecordIndex: number | undefined;
   const records = new Map<string, Uint8Array>();
   const fetchedRecordIndexes: number[] = [];
@@ -153,7 +157,7 @@ const createSurface = (useDefaultIdFactories = false) => {
     maximumRecordPlaintextBytes: 8,
     protocol: "TEST-1",
     createCapability: async () => ({
-      bytes: Uint8Array.of(42),
+      bytes: Uint8Array.of((capabilityId += 1)),
       protocol: "TEST-1",
       providerId: "test.crypto",
     }),
@@ -188,7 +192,9 @@ const createSurface = (useDefaultIdFactories = false) => {
     },
     revocations: revocationStore,
     store,
-    ...(useDefaultIdFactories ? {} : { transferIdFactory: () => "transfer-1" }),
+    ...(useDefaultIdFactories
+      ? {}
+      : { transferIdFactory: () => `transfer-${(transferId += 1)}` }),
   });
   return {
     client,
@@ -395,6 +401,102 @@ describe("secure transfer client", () => {
         revocation: { ...revocation, descriptorHash: wrongHash },
       }),
     ).rejects.toThrow("hash does not match");
+  });
+
+  test("rotates an attachment into one epoch-bound replacement payload", async () => {
+    const surface = createSurface();
+    const previousDescriptor = await upload(surface);
+    const replacement = await surface.client.prepareReplacement({
+      previousDescriptor,
+      reason: "membership-change",
+      replacement: {
+        attachmentId: previousDescriptor.attachmentId,
+        body: Uint8Array.of(9, 8, 7, 6, 5, 4, 3, 2, 1),
+        byteLength: 9,
+        conversationId: previousDescriptor.conversationId,
+        expiresAt: 1_600,
+        senderDeviceId: "alice-phone",
+      },
+      securityEpoch: 2,
+    });
+    expect(replacement.replacementDescriptor.transferId).toBe("transfer-2");
+    expect(replacement.replacementDescriptor.capability.bytes).not.toEqual(
+      previousDescriptor.capability.bytes,
+    );
+
+    const encoded = encodeSecureTransferReplacement(replacement);
+    const decoded = decodeSecureTransferReplacement(encoded, 4_096, 2_048);
+    expect(decoded).toEqual(replacement);
+    const extended = new TextEncoder().encode(
+      JSON.stringify({
+        ...JSON.parse(new TextDecoder().decode(encoded)),
+        keepFormerMember: true,
+      }),
+    );
+    expect(() =>
+      decodeSecureTransferReplacement(extended, 4_096, 2_048),
+    ).toThrow("unknown fields");
+
+    let persisted: string | undefined;
+    const activated = await surface.client.activateReplacement({
+      authenticatedContext: {
+        conversationId: "conversation-1",
+        purpose: "secure-transfer.replacement",
+        securityEpoch: 2,
+        senderId: "alice-phone",
+      },
+      persistReplacement: async (descriptor) => {
+        expect(surface.revocations.size).toBe(0);
+        persisted = descriptor.transferId;
+      },
+      previousDescriptor,
+      removeSupersededCiphertext: true,
+      replacement: decoded,
+    });
+    expect(persisted).toBe("transfer-2");
+    expect(activated).toEqual({
+      ciphertextRemoved: true,
+      revocation: "created",
+    });
+    expect(
+      [...surface.records.keys()].every((key) => key.startsWith("transfer-2:")),
+    ).toBe(true);
+  });
+
+  test("rejects replacement activation outside its authenticated MLS epoch", async () => {
+    const surface = createSurface();
+    const previousDescriptor = await upload(surface);
+    const replacement = await surface.client.prepareReplacement({
+      previousDescriptor,
+      reason: "device-recovery",
+      replacement: {
+        attachmentId: previousDescriptor.attachmentId,
+        body: Uint8Array.of(1),
+        byteLength: 1,
+        conversationId: previousDescriptor.conversationId,
+        expiresAt: 1_600,
+        senderDeviceId: "alice-phone",
+      },
+      securityEpoch: 3,
+    });
+    let persisted = false;
+    await expect(
+      surface.client.activateReplacement({
+        authenticatedContext: {
+          conversationId: "conversation-1",
+          purpose: "secure-transfer.replacement",
+          securityEpoch: 4,
+          senderId: "alice-phone",
+        },
+        persistReplacement: async () => {
+          persisted = true;
+        },
+        previousDescriptor,
+        replacement,
+      }),
+    ).rejects.toThrow("MLS epoch");
+    expect(persisted).toBe(false);
+    expect(surface.revocations.size).toBe(0);
   });
 
   test("aborts a staged destination on missing or substituted records", async () => {

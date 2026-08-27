@@ -98,6 +98,70 @@ sanitization program in
 [NIST SP 800-88 Rev. 2](https://csrc.nist.gov/pubs/sp/800/88/r2/final); that still
 does not sanitize independently held recipient copies.
 
+## Post-membership capability replacement
+
+An MLS removal changes who receives future epoch secrets, but it does not change
+an attachment capability already delivered in an earlier epoch. For retained
+attachments that a removed device must no longer fetch, upload a new encrypted
+copy with a fresh capability and send the replacement only in the new epoch:
+
+```ts
+const membership = await messaging.removeMembers({
+  conversationId,
+  deviceIds: [removedDeviceId],
+  ttlMs,
+});
+
+const replacement = await transfer.prepareReplacement({
+  previousDescriptor,
+  reason: "membership-change",
+  replacement: {
+    ...replacementMetadata,
+    body: reopenPlaintextSource(),
+    senderDeviceId,
+  },
+  securityEpoch: membership.epoch,
+});
+
+await messaging.send({
+  conversationId,
+  expectedSecurityEpoch: membership.epoch,
+  id: crypto.randomUUID(),
+  plaintext: encodeSecureTransferReplacement(replacement),
+  purpose: "secure-transfer.replacement",
+  ttlMs,
+});
+
+await transfer.activateReplacement({
+  authenticatedContext: {
+    conversationId,
+    purpose: "secure-transfer.replacement",
+    securityEpoch: membership.epoch,
+    senderId: senderDeviceId,
+  },
+  persistReplacement: saveProtectedDescriptor,
+  previousDescriptor,
+  removeSupersededCiphertext: true,
+  replacement,
+});
+```
+
+The secure-messaging send persists advanced MLS state and its retryable outbox
+entry before returning, even when delivery is queued. Only then should the
+sender activate supersession and remove old ciphertext. A recipient strictly
+decodes the same payload and passes the message's authenticated context to
+`activateReplacement()`. Activation verifies the old descriptor hash, fresh
+transfer ID and capability, attachment, conversation, sender, purpose, and exact
+epoch. Its `persistReplacement` callback runs before the old tombstone is
+installed and must be durable, idempotent, and protect the bearer descriptor.
+
+If activation crashes after descriptor persistence but before supersession,
+retry the same payload. This temporarily leaves the old transfer usable instead
+of stranding the replacement. Expiry sweeps clean abandoned new ciphertext when
+a message can never be durably queued. Rate-limit rotations and prioritize only
+attachments that remain useful; membership churn must not become an unbounded
+re-encryption denial of service.
+
 ## Resumable uploads
 
 Configure a `SecureTransferReceiptProtector` and
@@ -181,6 +245,8 @@ encoding, full and byte-range authenticated download, resumable crash recovery,
 transactional sinks, honest future-fetch revocation, cleanup, and provider/store
 contracts. Concrete local and S3/R2 storage adapters live in
 [`secure-transfer-adapters`](https://github.com/absolutejs/secure-transfer-adapters).
+Version `0.3.0` adds epoch-bound fresh-capability replacement and staged
+supersession after MLS membership changes.
 
 ## License
 

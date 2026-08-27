@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.0
+
+- Add strict attachment-replacement payloads containing a fresh descriptor and
+  descriptor-bound supersession notice for one MLS application message.
+- Bind replacement activation to the authenticated conversation, sender,
+  purpose, and exact post-membership-change MLS security epoch.
+- Persist the new protected bearer descriptor before enforcing supersession and
+  make old-ciphertext cleanup an explicit sender-side option.
+- Reject transfer-ID reuse and crypto providers that return the old capability
+  during replacement.
+
 ## 0.2.0
 
 - Add authenticated byte-range downloads that fetch only covering records,

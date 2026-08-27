@@ -12,6 +12,7 @@ import {
 } from "./errors";
 import {
   SECURE_TRANSFER_CONTRACT,
+  SECURE_TRANSFER_REPLACEMENT_CONTRACT,
   SECURE_TRANSFER_REVOCATION_CONTRACT,
   SECURE_TRANSFER_UPLOAD_RECEIPT_CONTRACT,
   type SecureTransferClient,
@@ -19,6 +20,8 @@ import {
   type SecureTransferByteRange,
   type SecureTransferDescriptor,
   type SecureTransferPolicy,
+  type SecureTransferReplacement,
+  type SecureTransferReplacementAuthenticatedContext,
   type SecureTransferRecordContext,
   type SecureTransferUploadInput,
   type SecureTransferUploadMetadata,
@@ -71,6 +74,12 @@ const validRevocationReason = (value: unknown): boolean =>
   value === "member-removed" ||
   value === "superseded" ||
   value === "user-request";
+
+const validReplacementReason = (value: unknown): boolean =>
+  value === "device-recovery" ||
+  value === "manual-rotation" ||
+  value === "membership-change" ||
+  value === "self-update";
 
 const createContext = (
   descriptor: SecureTransferDescriptor,
@@ -323,6 +332,48 @@ export const createSecureTransferClient = (
         `Decrypted transfer record ${recordIndex} has the wrong size.`,
       );
     return plaintext;
+  };
+
+  const validateReplacement = async (
+    previousDescriptor: SecureTransferDescriptor,
+    replacement: SecureTransferReplacement,
+    authenticatedContext: SecureTransferReplacementAuthenticatedContext,
+  ): Promise<Uint8Array> => {
+    validateDescriptor(previousDescriptor, true);
+    validateDescriptor(replacement.replacementDescriptor);
+    const next = replacement.replacementDescriptor;
+    if (
+      replacement.contract !== SECURE_TRANSFER_REPLACEMENT_CONTRACT ||
+      !validReplacementReason(replacement.reason) ||
+      !Number.isSafeInteger(replacement.securityEpoch) ||
+      replacement.securityEpoch < 0 ||
+      replacement.securityEpoch !== authenticatedContext.securityEpoch ||
+      authenticatedContext.purpose !== "secure-transfer.replacement" ||
+      authenticatedContext.conversationId !==
+        previousDescriptor.conversationId ||
+      authenticatedContext.conversationId !== next.conversationId ||
+      authenticatedContext.senderId !== next.senderDeviceId ||
+      authenticatedContext.senderId !==
+        replacement.supersession.revokerDeviceId ||
+      replacement.supersession.contract !==
+        SECURE_TRANSFER_REVOCATION_CONTRACT ||
+      replacement.supersession.reason !== "superseded" ||
+      replacement.supersession.transferId !== previousDescriptor.transferId ||
+      replacement.supersession.revokedAt !== next.createdAt ||
+      next.attachmentId !== previousDescriptor.attachmentId ||
+      next.transferId === previousDescriptor.transferId ||
+      next.createdAt < previousDescriptor.createdAt ||
+      equalBytes(next.capability.bytes, previousDescriptor.capability.bytes)
+    )
+      throw new SecureTransferProtocolError(
+        "Transfer replacement does not match its descriptors, sender, or MLS epoch.",
+      );
+    const hash = await descriptorHash(previousDescriptor);
+    if (!equalBytes(hash, replacement.supersession.descriptorHash))
+      throw new SecureTransferProtocolError(
+        "Transfer replacement supersession hash does not match.",
+      );
+    return hash;
   };
 
   const prepareUpload = async (input: SecureTransferUploadMetadata) => {
@@ -723,6 +774,38 @@ export const createSecureTransferClient = (
   };
 
   return Object.freeze({
+    activateReplacement: async ({
+      authenticatedContext,
+      persistReplacement,
+      previousDescriptor,
+      removeSupersededCiphertext = false,
+      replacement,
+    }) => {
+      const configuredRevocations = requireRevocations();
+      const hash = await validateReplacement(
+        previousDescriptor,
+        replacement,
+        authenticatedContext,
+      );
+      await persistReplacement(replacement.replacementDescriptor);
+      const revocation = await configuredRevocations.put({
+        descriptorHash: hash.slice(),
+        retainUntil: Math.max(
+          previousDescriptor.expiresAt,
+          replacement.supersession.revokedAt,
+        ),
+        revokedAt: replacement.supersession.revokedAt,
+        transferId: previousDescriptor.transferId,
+      });
+      if (!removeSupersededCiphertext) return Object.freeze({ revocation });
+      let ciphertextRemoved = true;
+      try {
+        await options.store.removeTransfer(previousDescriptor.transferId);
+      } catch {
+        ciphertextRemoved = false;
+      }
+      return Object.freeze({ ciphertextRemoved, revocation });
+    },
     applyRevocation: async ({ descriptor, revocation }) => {
       validateDescriptor(descriptor, true);
       requireText(revocation.revokerDeviceId, "revokerDeviceId");
@@ -813,6 +896,52 @@ export const createSecureTransferClient = (
     remove: async (descriptor) => {
       validateDescriptor(descriptor, true);
       await options.store.removeTransfer(descriptor.transferId);
+    },
+    prepareReplacement: async ({
+      previousDescriptor,
+      reason,
+      replacement,
+      securityEpoch,
+    }) => {
+      validateDescriptor(previousDescriptor);
+      if (
+        !validReplacementReason(reason) ||
+        !Number.isSafeInteger(securityEpoch) ||
+        securityEpoch < 0 ||
+        replacement.attachmentId !== previousDescriptor.attachmentId ||
+        replacement.conversationId !== previousDescriptor.conversationId
+      )
+        throw new SecureTransferProtocolError(
+          "Replacement input does not match the prior attachment or MLS epoch.",
+        );
+      const next = await upload(replacement);
+      if (
+        next.senderDeviceId !== replacement.senderDeviceId ||
+        next.transferId === previousDescriptor.transferId ||
+        equalBytes(next.capability.bytes, previousDescriptor.capability.bytes)
+      ) {
+        await options.store
+          .removeTransfer(next.transferId)
+          .catch(() => undefined);
+        throw new SecureTransferProtocolError(
+          "Replacement did not receive a fresh transfer capability.",
+        );
+      }
+      const hash = await descriptorHash(previousDescriptor);
+      return Object.freeze({
+        contract: SECURE_TRANSFER_REPLACEMENT_CONTRACT,
+        reason,
+        replacementDescriptor: next,
+        securityEpoch,
+        supersession: Object.freeze({
+          contract: SECURE_TRANSFER_REVOCATION_CONTRACT,
+          descriptorHash: hash.slice(),
+          reason: "superseded" as const,
+          revokedAt: next.createdAt,
+          revokerDeviceId: next.senderDeviceId,
+          transferId: previousDescriptor.transferId,
+        }),
+      });
     },
     revoke: async ({ descriptor, reason, revokerDeviceId }) => {
       validateDescriptor(descriptor, true);

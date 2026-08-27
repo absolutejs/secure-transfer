@@ -1,9 +1,11 @@
 import { SecureTransferProtocolError } from "./errors";
 import {
   SECURE_TRANSFER_CONTRACT,
+  SECURE_TRANSFER_REPLACEMENT_CONTRACT,
   SECURE_TRANSFER_REVOCATION_CONTRACT,
   SECURE_TRANSFER_UPLOAD_RECEIPT_CONTRACT,
   type SecureTransferDescriptor,
+  type SecureTransferReplacement,
   type SecureTransferRevocation,
   type SecureTransferUploadReceipt,
 } from "./types";
@@ -264,6 +266,91 @@ export const decodeSecureTransferDescriptor = (
     storeId: value.storeId,
     transferId: value.transferId,
   });
+};
+
+export const encodeSecureTransferReplacement = (
+  replacement: SecureTransferReplacement,
+): Uint8Array =>
+  new TextEncoder().encode(
+    JSON.stringify({
+      contract: replacement.contract,
+      reason: replacement.reason,
+      replacementDescriptor: base64url(
+        encodeSecureTransferDescriptor(replacement.replacementDescriptor),
+      ),
+      securityEpoch: replacement.securityEpoch,
+      supersession: base64url(
+        encodeSecureTransferRevocation(replacement.supersession),
+      ),
+    }),
+  );
+
+export const decodeSecureTransferReplacement = (
+  bytes: Uint8Array,
+  maximumBytes: number,
+  maximumDescriptorBytes: number,
+): SecureTransferReplacement => {
+  if (
+    !Number.isSafeInteger(maximumBytes) ||
+    maximumBytes < 1 ||
+    bytes.length === 0 ||
+    bytes.length > maximumBytes
+  )
+    throw new SecureTransferProtocolError(
+      "Transfer replacement violates the encoded size limit.",
+    );
+  let value: unknown;
+  try {
+    value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+  } catch {
+    throw new SecureTransferProtocolError(
+      "Transfer replacement is not valid JSON.",
+    );
+  }
+  const reasons = new Set([
+    "device-recovery",
+    "manual-rotation",
+    "membership-change",
+    "self-update",
+  ]);
+  if (
+    !isRecord(value) ||
+    !exactKeys(value, [
+      "contract",
+      "reason",
+      "replacementDescriptor",
+      "securityEpoch",
+      "supersession",
+    ]) ||
+    value.contract !== SECURE_TRANSFER_REPLACEMENT_CONTRACT ||
+    typeof value.reason !== "string" ||
+    !reasons.has(value.reason) ||
+    typeof value.replacementDescriptor !== "string" ||
+    !Number.isSafeInteger(value.securityEpoch) ||
+    Number(value.securityEpoch) < 0 ||
+    typeof value.supersession !== "string"
+  )
+    throw new SecureTransferProtocolError(
+      "Transfer replacement shape is invalid or contains unknown fields.",
+    );
+  const supersession = decodeSecureTransferRevocation(
+    fromBase64url(value.supersession),
+    maximumBytes,
+  );
+  if (supersession.reason !== "superseded")
+    throw new SecureTransferProtocolError(
+      "Transfer replacement must carry a supersession revocation.",
+    );
+  return Object.freeze({
+    contract: SECURE_TRANSFER_REPLACEMENT_CONTRACT,
+    reason: value.reason,
+    replacementDescriptor: decodeSecureTransferDescriptor(
+      fromBase64url(value.replacementDescriptor),
+      maximumDescriptorBytes,
+    ),
+    securityEpoch: Number(value.securityEpoch),
+    supersession,
+  }) as SecureTransferReplacement;
 };
 
 export const encodeSecureTransferUploadReceipt = (
