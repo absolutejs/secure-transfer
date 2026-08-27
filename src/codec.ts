@@ -1,8 +1,10 @@
 import { SecureTransferProtocolError } from "./errors";
 import {
   SECURE_TRANSFER_CONTRACT,
+  SECURE_TRANSFER_REVOCATION_CONTRACT,
   SECURE_TRANSFER_UPLOAD_RECEIPT_CONTRACT,
   type SecureTransferDescriptor,
+  type SecureTransferRevocation,
   type SecureTransferUploadReceipt,
 } from "./types";
 
@@ -13,6 +15,97 @@ const base64url = (bytes: Uint8Array): string => {
     .replaceAll("+", "-")
     .replaceAll("/", "_")
     .replace(/=+$/u, "");
+};
+
+export const hashSecureTransferDescriptor = async (
+  descriptor: SecureTransferDescriptor,
+): Promise<Uint8Array> => {
+  const encoded = encodeSecureTransferDescriptor(descriptor);
+  const bytes = encoded.buffer.slice(
+    encoded.byteOffset,
+    encoded.byteOffset + encoded.byteLength,
+  ) as ArrayBuffer;
+  return new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+};
+
+export const encodeSecureTransferRevocation = (
+  revocation: SecureTransferRevocation,
+): Uint8Array =>
+  new TextEncoder().encode(
+    JSON.stringify({
+      contract: revocation.contract,
+      descriptorHash: base64url(revocation.descriptorHash),
+      ...(revocation.reason === undefined ? {} : { reason: revocation.reason }),
+      revokedAt: revocation.revokedAt,
+      revokerDeviceId: revocation.revokerDeviceId,
+      transferId: revocation.transferId,
+    }),
+  );
+
+export const decodeSecureTransferRevocation = (
+  bytes: Uint8Array,
+  maximumBytes: number,
+): SecureTransferRevocation => {
+  if (
+    !Number.isSafeInteger(maximumBytes) ||
+    maximumBytes < 1 ||
+    bytes.length === 0 ||
+    bytes.length > maximumBytes
+  )
+    throw new SecureTransferProtocolError(
+      "Transfer revocation violates the encoded size limit.",
+    );
+  let value: unknown;
+  try {
+    value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+  } catch {
+    throw new SecureTransferProtocolError(
+      "Transfer revocation is not valid JSON.",
+    );
+  }
+  const reasons = new Set([
+    "access-revoked",
+    "member-removed",
+    "superseded",
+    "user-request",
+  ]);
+  if (
+    !isRecord(value) ||
+    !exactKeys(
+      value,
+      [
+        "contract",
+        "descriptorHash",
+        "revokedAt",
+        "revokerDeviceId",
+        "transferId",
+      ],
+      ["reason"],
+    ) ||
+    value.contract !== SECURE_TRANSFER_REVOCATION_CONTRACT ||
+    typeof value.descriptorHash !== "string" ||
+    !isPositiveInteger(value.revokedAt) ||
+    !isText(value.revokerDeviceId) ||
+    !isText(value.transferId) ||
+    (value.reason !== undefined &&
+      (typeof value.reason !== "string" || !reasons.has(value.reason)))
+  )
+    throw new SecureTransferProtocolError(
+      "Transfer revocation shape is invalid or contains unknown fields.",
+    );
+  const descriptorHash = fromBase64url(value.descriptorHash);
+  if (descriptorHash.length !== 32)
+    throw new SecureTransferProtocolError(
+      "Transfer revocation descriptor hash must be SHA-256.",
+    );
+  return Object.freeze({
+    contract: SECURE_TRANSFER_REVOCATION_CONTRACT,
+    descriptorHash,
+    ...(value.reason === undefined ? {} : { reason: value.reason }),
+    revokedAt: value.revokedAt,
+    revokerDeviceId: value.revokerDeviceId,
+    transferId: value.transferId,
+  }) as SecureTransferRevocation;
 };
 
 const fromBase64url = (value: string): Uint8Array => {

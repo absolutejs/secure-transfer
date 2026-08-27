@@ -2,17 +2,21 @@ import {
   decodeSecureTransferUploadReceipt,
   encodeSecureTransferDescriptor,
   encodeSecureTransferUploadReceipt,
+  hashSecureTransferDescriptor,
 } from "./codec";
 import {
   SecureTransferConfigurationError,
   SecureTransferProtocolError,
+  SecureTransferRevokedError,
   SecureTransferResumeUnsafeError,
 } from "./errors";
 import {
   SECURE_TRANSFER_CONTRACT,
+  SECURE_TRANSFER_REVOCATION_CONTRACT,
   SECURE_TRANSFER_UPLOAD_RECEIPT_CONTRACT,
   type SecureTransferClient,
   type SecureTransferClientOptions,
+  type SecureTransferByteRange,
   type SecureTransferDescriptor,
   type SecureTransferPolicy,
   type SecureTransferRecordContext,
@@ -60,6 +64,13 @@ const equalBytes = (left: Uint8Array, right: Uint8Array): boolean => {
     difference |= (left[index] ?? 0) ^ (right[index] ?? 0);
   return difference === 0;
 };
+
+const validRevocationReason = (value: unknown): boolean =>
+  value === undefined ||
+  value === "access-revoked" ||
+  value === "member-removed" ||
+  value === "superseded" ||
+  value === "user-request";
 
 const createContext = (
   descriptor: SecureTransferDescriptor,
@@ -144,6 +155,8 @@ export const createSecureTransferClient = (
   requireText(options.cryptoProvider.id, "crypto provider id");
   requireText(options.cryptoProvider.protocol, "crypto provider protocol");
   requireText(options.store.id, "store id");
+  if (options.revocations !== undefined)
+    requireText(options.revocations.id, "revocation store id");
   if (
     !positiveInteger(options.cryptoProvider.maximumRecordCiphertextBytes) ||
     !positiveInteger(options.cryptoProvider.maximumRecordPlaintextBytes) ||
@@ -235,6 +248,81 @@ export const createSecureTransferClient = (
       throw new SecureTransferProtocolError(
         "Transfer descriptor violates local policy or provider binding.",
       );
+  };
+
+  const requireRevocations = () => {
+    if (options.revocations === undefined)
+      throw new SecureTransferConfigurationError(
+        "Attachment revocation requires a trusted revocation store.",
+      );
+    return options.revocations;
+  };
+
+  const descriptorHash = (descriptor: SecureTransferDescriptor) =>
+    hashSecureTransferDescriptor(descriptor);
+
+  const requireNotRevoked = async (
+    descriptor: SecureTransferDescriptor,
+    hash: Uint8Array,
+  ): Promise<void> => {
+    if (
+      options.revocations !== undefined &&
+      (await options.revocations.has({
+        descriptorHash: hash,
+        transferId: descriptor.transferId,
+      }))
+    )
+      throw new SecureTransferRevokedError(
+        "Transfer access was revoked by trusted policy state.",
+      );
+  };
+
+  const validateRange = (
+    descriptor: SecureTransferDescriptor,
+    range: SecureTransferByteRange,
+  ): void => {
+    if (
+      !Number.isSafeInteger(range.start) ||
+      range.start < 0 ||
+      !Number.isSafeInteger(range.endExclusive) ||
+      range.endExclusive <= range.start ||
+      range.endExclusive > descriptor.plaintextBytes
+    )
+      throw new SecureTransferProtocolError(
+        "Transfer byte range must be non-empty and within the plaintext.",
+      );
+  };
+
+  const openRecord = async (
+    descriptor: SecureTransferDescriptor,
+    recordIndex: number,
+  ): Promise<Uint8Array> => {
+    const ciphertext = await options.store.getRecord({
+      recordIndex,
+      transferId: descriptor.transferId,
+    });
+    if (ciphertext === undefined)
+      throw new SecureTransferProtocolError(
+        `Encrypted transfer record ${recordIndex} is missing.`,
+      );
+    if (
+      ciphertext.length === 0 ||
+      ciphertext.length > options.cryptoProvider.maximumRecordCiphertextBytes
+    )
+      throw new SecureTransferProtocolError(
+        `Encrypted transfer record ${recordIndex} violates the ciphertext limit.`,
+      );
+    const context = createContext(descriptor, recordIndex);
+    const plaintext = await options.cryptoProvider.openRecord({
+      capability: descriptor.capability,
+      ciphertext,
+      context,
+    });
+    if (plaintext.length !== context.plaintextBytes)
+      throw new SecureTransferProtocolError(
+        `Decrypted transfer record ${recordIndex} has the wrong size.`,
+      );
+    return plaintext;
   };
 
   const prepareUpload = async (input: SecureTransferUploadMetadata) => {
@@ -635,47 +723,88 @@ export const createSecureTransferClient = (
   };
 
   return Object.freeze({
+    applyRevocation: async ({ descriptor, revocation }) => {
+      validateDescriptor(descriptor, true);
+      requireText(revocation.revokerDeviceId, "revokerDeviceId");
+      if (
+        revocation.contract !== SECURE_TRANSFER_REVOCATION_CONTRACT ||
+        revocation.descriptorHash.length !== 32 ||
+        revocation.transferId !== descriptor.transferId ||
+        !Number.isSafeInteger(revocation.revokedAt) ||
+        revocation.revokedAt < descriptor.createdAt ||
+        revocation.revokedAt - now() > options.policy.maximumFutureSkewMs ||
+        !validRevocationReason(revocation.reason)
+      )
+        throw new SecureTransferProtocolError(
+          "Transfer revocation does not match the descriptor or local policy.",
+        );
+      const hash = await descriptorHash(descriptor);
+      if (!equalBytes(hash, revocation.descriptorHash))
+        throw new SecureTransferProtocolError(
+          "Transfer revocation descriptor hash does not match.",
+        );
+      return requireRevocations().put({
+        descriptorHash: hash.slice(),
+        retainUntil: Math.max(descriptor.expiresAt, revocation.revokedAt),
+        revokedAt: revocation.revokedAt,
+        transferId: descriptor.transferId,
+      });
+    },
     beginResumableUpload,
     download: async (descriptor, sink) => {
       try {
         validateDescriptor(descriptor);
+        const hash = await descriptorHash(descriptor);
+        await requireNotRevoked(descriptor, hash);
         for (
           let recordIndex = 0;
           recordIndex < descriptor.recordCount;
           recordIndex += 1
         ) {
-          const ciphertext = await options.store.getRecord({
-            recordIndex,
-            transferId: descriptor.transferId,
-          });
-          if (ciphertext === undefined)
-            throw new SecureTransferProtocolError(
-              `Encrypted transfer record ${recordIndex} is missing.`,
-            );
-          if (
-            ciphertext.length === 0 ||
-            ciphertext.length >
-              options.cryptoProvider.maximumRecordCiphertextBytes
-          )
-            throw new SecureTransferProtocolError(
-              `Encrypted transfer record ${recordIndex} violates the ciphertext limit.`,
-            );
-          const plaintext = await options.cryptoProvider.openRecord({
-            capability: descriptor.capability,
-            ciphertext,
-            context: createContext(descriptor, recordIndex),
-          });
-          const expected = createContext(
-            descriptor,
-            recordIndex,
-          ).plaintextBytes;
-          if (plaintext.length !== expected)
-            throw new SecureTransferProtocolError(
-              `Decrypted transfer record ${recordIndex} has the wrong size.`,
-            );
+          await requireNotRevoked(descriptor, hash);
+          const plaintext = await openRecord(descriptor, recordIndex);
           await sink.write(plaintext, recordIndex);
         }
+        await requireNotRevoked(descriptor, hash);
         await sink.commit(descriptor);
+      } catch (error) {
+        await sink.abort(error).catch(() => undefined);
+        throw error;
+      }
+    },
+    downloadRange: async (descriptor, range, sink) => {
+      try {
+        validateDescriptor(descriptor);
+        validateRange(descriptor, range);
+        const hash = await descriptorHash(descriptor);
+        await requireNotRevoked(descriptor, hash);
+        const firstRecord = Math.floor(
+          range.start / descriptor.recordPlaintextBytes,
+        );
+        const finalRecord = Math.floor(
+          (range.endExclusive - 1) / descriptor.recordPlaintextBytes,
+        );
+        for (
+          let recordIndex = firstRecord;
+          recordIndex <= finalRecord;
+          recordIndex += 1
+        ) {
+          await requireNotRevoked(descriptor, hash);
+          const plaintext = await openRecord(descriptor, recordIndex);
+          const recordOffset = recordIndex * descriptor.recordPlaintextBytes;
+          const start = Math.max(0, range.start - recordOffset);
+          const end = Math.min(
+            plaintext.length,
+            range.endExclusive - recordOffset,
+          );
+          await sink.write(
+            plaintext.slice(start, end),
+            recordIndex,
+            recordOffset + start,
+          );
+        }
+        await requireNotRevoked(descriptor, hash);
+        await sink.commit(descriptor, range);
       } catch (error) {
         await sink.abort(error).catch(() => undefined);
         throw error;
@@ -684,6 +813,46 @@ export const createSecureTransferClient = (
     remove: async (descriptor) => {
       validateDescriptor(descriptor, true);
       await options.store.removeTransfer(descriptor.transferId);
+    },
+    revoke: async ({ descriptor, reason, revokerDeviceId }) => {
+      validateDescriptor(descriptor, true);
+      requireText(revokerDeviceId, "revokerDeviceId");
+      if (
+        new TextEncoder().encode(revokerDeviceId).length > 512 ||
+        !validRevocationReason(reason)
+      )
+        throw new SecureTransferProtocolError(
+          "Revocation device identifier or reason is invalid.",
+        );
+      const revokedAt = now();
+      if (!Number.isSafeInteger(revokedAt) || revokedAt < descriptor.createdAt)
+        throw new SecureTransferProtocolError(
+          "Revocation timestamp precedes the transfer or is unsafe.",
+        );
+      const hash = await descriptorHash(descriptor);
+      await requireRevocations().put({
+        descriptorHash: hash.slice(),
+        retainUntil: Math.max(descriptor.expiresAt, revokedAt),
+        revokedAt,
+        transferId: descriptor.transferId,
+      });
+      let ciphertextRemoved = true;
+      try {
+        await options.store.removeTransfer(descriptor.transferId);
+      } catch {
+        ciphertextRemoved = false;
+      }
+      return Object.freeze({
+        ciphertextRemoved,
+        revocation: Object.freeze({
+          contract: SECURE_TRANSFER_REVOCATION_CONTRACT,
+          descriptorHash: hash.slice(),
+          ...(reason === undefined ? {} : { reason }),
+          revokedAt,
+          revokerDeviceId,
+          transferId: descriptor.transferId,
+        }),
+      });
     },
     resumeUpload,
     upload,

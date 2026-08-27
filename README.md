@@ -39,6 +39,65 @@ await messaging.send({
 });
 ```
 
+## Authenticated byte ranges
+
+`downloadRange()` authenticates every complete encrypted record covering the
+requested interval, then passes only the selected plaintext bytes to a
+transactional range sink. The range is `[start, endExclusive)` and must be
+non-empty and within the descriptor's declared plaintext size.
+
+```ts
+await transfer.downloadRange(
+  descriptor,
+  { start: 1_048_576, endExclusive: 2_097_152 },
+  rangeSink,
+);
+```
+
+This proves the authenticity and position of the requested records against the
+descriptor. It intentionally does not fetch or prove the current availability
+of records outside the range.
+
+## Honest revocation
+
+Configure a trusted `SecureTransferRevocationStore`, then create the durable
+tombstone before attempting ciphertext cleanup:
+
+```ts
+const { revocation, ciphertextRemoved } = await transfer.revoke({
+  descriptor,
+  reason: "member-removed",
+  revokerDeviceId,
+});
+
+await messaging.send({
+  conversationId,
+  id: crypto.randomUUID(),
+  plaintext: encodeSecureTransferRevocation(revocation),
+  purpose: "secure-transfer.revocation",
+  ttlMs,
+});
+```
+
+Recipients must authenticate the E2EE sender, authorize that device to revoke
+the attachment, strictly decode the notice, and only then call
+`applyRevocation()`. The notice is bound to the exact descriptor by a SHA-256
+hash. Downloads consult trusted policy state before and throughout retrieval and
+fail closed when that store errors. Keep tombstones at least through the
+descriptor expiry; `ciphertextRemoved: false` means cleanup must be retried even
+though cooperating clients already block the transfer.
+
+Revocation is not retroactive cryptographic erasure. A bearer capability,
+ciphertext, or plaintext already copied by a recipient cannot be recalled.
+After an MLS member removal, use a fresh capability for replacement content and
+deliver its descriptor only in the new epoch; removal protects future epoch
+traffic, not secrets the former member already received. This follows the epoch
+and member-removal model in [RFC 9420](https://www.rfc-editor.org/rfc/rfc9420.html).
+Where a deployment uses cryptographic erase for storage cleanup, follow the key
+sanitization program in
+[NIST SP 800-88 Rev. 2](https://csrc.nist.gov/pubs/sp/800/88/r2/final); that still
+does not sanitize independently held recipient copies.
+
 ## Resumable uploads
 
 Configure a `SecureTransferReceiptProtector` and
@@ -94,6 +153,10 @@ normal chat message.
 - Downloads target a staging sink. `commit()` occurs only after every record is
   authenticated; failure calls `abort()` so partial plaintext is not mistaken for
   a complete file.
+- Range downloads preserve the same staging rule but authenticate only records
+  intersecting the requested byte interval.
+- Revocation stores are trusted authorization state and should use credentials
+  and retention controls distinct from untrusted ciphertext storage.
 - Upload failure makes a best-effort ciphertext cleanup. Production adapters
   should implement `SecureTransferLifecycleStore` and run bounded expiry sweeps
   repeatedly with the returned `cursor` until `truncated` is false so live
@@ -113,10 +176,10 @@ ciphertext without deliberately changing the confidentiality boundary.
 
 ## Scope
 
-Version `0.1.0` provides upload, strict descriptor and receipt encoding,
-authenticated download, resumable crash recovery, transactional sinks, cleanup,
-and provider/store contracts. Range selection and attachment revocation remain
-roadmap work. Concrete local and S3/R2 storage adapters live in
+Version `0.2.0` provides upload, strict descriptor, receipt, and revocation
+encoding, full and byte-range authenticated download, resumable crash recovery,
+transactional sinks, honest future-fetch revocation, cleanup, and provider/store
+contracts. Concrete local and S3/R2 storage adapters live in
 [`secure-transfer-adapters`](https://github.com/absolutejs/secure-transfer-adapters).
 
 ## License

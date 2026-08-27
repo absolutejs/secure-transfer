@@ -14,3 +14,8 @@ export class SecureTransferProtocolError extends SecureTransferError {
 export class SecureTransferResumeUnsafeError extends SecureTransferError {
   override readonly name = "SecureTransferResumeUnsafeError";
 }
+
+/** A trusted policy tombstone forbids this client from fetching the transfer. */
+export class SecureTransferRevokedError extends SecureTransferError {
+  override readonly name = "SecureTransferRevokedError";
+}

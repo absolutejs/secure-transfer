@@ -1,4 +1,5 @@
 export const SECURE_TRANSFER_CONTRACT = 1 as const;
+export const SECURE_TRANSFER_REVOCATION_CONTRACT = 1 as const;
 export const SECURE_TRANSFER_UPLOAD_RECEIPT_CONTRACT = 1 as const;
 
 export type SecureTransferRecordContext = {
@@ -109,9 +110,71 @@ export type SecureTransferClientOptions = {
   readonly now?: () => number;
   readonly policy: SecureTransferPolicy;
   readonly store: SecureTransferStore;
+  /** Trusted policy state. Downloads fail closed when this store is unavailable. */
+  readonly revocations?: SecureTransferRevocationStore;
   readonly transferIdFactory?: () => string;
   readonly resumable?: SecureTransferResumableOptions;
 };
+
+export type SecureTransferByteRange = {
+  /** Inclusive plaintext byte offset. */
+  readonly start: number;
+  /** Exclusive plaintext byte offset. */
+  readonly endExclusive: number;
+};
+
+export type SecureTransferRevocationReason =
+  "access-revoked" | "member-removed" | "superseded" | "user-request";
+
+/**
+ * An immutable revocation notice intended for authenticated E2EE delivery.
+ * It prevents future cooperating-client fetches; it cannot recall copied keys,
+ * ciphertext, or plaintext.
+ */
+export type SecureTransferRevocation = {
+  readonly contract: typeof SECURE_TRANSFER_REVOCATION_CONTRACT;
+  readonly descriptorHash: Uint8Array;
+  readonly revokedAt: number;
+  readonly revokerDeviceId: string;
+  readonly transferId: string;
+  readonly reason?: SecureTransferRevocationReason;
+};
+
+export type SecureTransferRevocationStore = {
+  readonly id: string;
+  has(input: {
+    readonly descriptorHash: Uint8Array;
+    readonly transferId: string;
+  }): Promise<boolean>;
+  put(input: {
+    readonly descriptorHash: Uint8Array;
+    /** Tombstones must remain available through this time. */
+    readonly retainUntil: number;
+    readonly revokedAt: number;
+    readonly transferId: string;
+  }): Promise<"created" | "exists">;
+};
+
+export type SecureTransferRevocationExpirySweepInput = {
+  readonly cursor?: string;
+  readonly maximumRevocations: number;
+  /** Remove tombstones whose required retention ended at or before this time. */
+  readonly retainUntilOrBefore: number;
+};
+
+export type SecureTransferRevocationExpirySweepResult = {
+  readonly cursor?: string;
+  readonly examinedRevocations: number;
+  readonly removedRevocations: number;
+  readonly truncated: boolean;
+};
+
+export type SecureTransferRevocationLifecycleStore =
+  SecureTransferRevocationStore & {
+    sweepExpiredRevocations(
+      input: SecureTransferRevocationExpirySweepInput,
+    ): Promise<SecureTransferRevocationExpirySweepResult>;
+  };
 
 export type SecureTransferUploadInput = {
   readonly attachmentId: string;
@@ -238,7 +301,25 @@ export type SecureTransferSink = {
   readonly write: (record: Uint8Array, recordIndex: number) => Promise<void>;
 };
 
+export type SecureTransferRangeSink = {
+  readonly abort: (reason: unknown) => Promise<void>;
+  readonly commit: (
+    descriptor: SecureTransferDescriptor,
+    range: SecureTransferByteRange,
+  ) => Promise<void>;
+  readonly write: (
+    bytes: Uint8Array,
+    recordIndex: number,
+    plaintextOffset: number,
+  ) => Promise<void>;
+};
+
 export type SecureTransferClient = {
+  /** Apply only after the E2EE sender is authenticated and authorized to revoke. */
+  readonly applyRevocation: (input: {
+    readonly descriptor: SecureTransferDescriptor;
+    readonly revocation: SecureTransferRevocation;
+  }) => Promise<"created" | "exists">;
   readonly beginResumableUpload: (
     input: SecureTransferUploadMetadata,
   ) => Promise<{ readonly receiptId: string }>;
@@ -246,7 +327,20 @@ export type SecureTransferClient = {
     descriptor: SecureTransferDescriptor,
     sink: SecureTransferSink,
   ) => Promise<void>;
+  readonly downloadRange: (
+    descriptor: SecureTransferDescriptor,
+    range: SecureTransferByteRange,
+    sink: SecureTransferRangeSink,
+  ) => Promise<void>;
   readonly remove: (descriptor: SecureTransferDescriptor) => Promise<void>;
+  readonly revoke: (input: {
+    readonly descriptor: SecureTransferDescriptor;
+    readonly reason?: SecureTransferRevocationReason;
+    readonly revokerDeviceId: string;
+  }) => Promise<{
+    readonly ciphertextRemoved: boolean;
+    readonly revocation: SecureTransferRevocation;
+  }>;
   readonly resumeUpload: (input: {
     readonly receiptId: string;
     readonly source: SecureTransferResumeSource;

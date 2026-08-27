@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.0
+
+- Add authenticated byte-range downloads that fetch only covering records,
+  authenticate complete records, slice verified plaintext, and commit atomically.
+- Add strict SHA-256 descriptor-bound revocation notices for authenticated E2EE
+  delivery and trusted, immutable revocation-store enforcement.
+- Recheck revocation policy throughout downloads and report ciphertext cleanup
+  separately from durable access revocation.
+- Document that revocation prevents future cooperating-client fetches but cannot
+  recall a capability, ciphertext, or plaintext already copied by a recipient.
+
 ## 0.1.2
 
 - Preserve the Web Crypto receiver when invoking default UUID factories in Bun

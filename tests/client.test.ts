@@ -3,13 +3,16 @@ import {
   SECURE_TRANSFER_CONTRACT,
   createSecureTransferClient,
   decodeSecureTransferDescriptor,
+  decodeSecureTransferRevocation,
   decodeSecureTransferUploadReceipt,
   encodeSecureTransferDescriptor,
+  encodeSecureTransferRevocation,
   encodeSecureTransferUploadReceipt,
   SecureTransferResumeUnsafeError,
   type SecureTransferCryptoProvider,
   type SecureTransferProtectedReceiptStore,
   type SecureTransferReceiptProtector,
+  type SecureTransferRevocationStore,
   type SecureTransferSink,
   type SecureTransferStore,
 } from "../src";
@@ -18,6 +21,8 @@ const createSurface = (useDefaultIdFactories = false) => {
   let currentTime = 1_000;
   let failPutRecordIndex: number | undefined;
   const records = new Map<string, Uint8Array>();
+  const fetchedRecordIndexes: number[] = [];
+  const revocations = new Set<string>();
   const removed: string[] = [];
   let receiptUpdate = 0;
   let failReceiptUpdate: number | undefined;
@@ -111,8 +116,10 @@ const createSurface = (useDefaultIdFactories = false) => {
   };
   const store: SecureTransferStore = {
     id: "memory-store",
-    getRecord: async ({ recordIndex, transferId }) =>
-      records.get(`${transferId}:${recordIndex}`)?.slice(),
+    getRecord: async ({ recordIndex, transferId }) => {
+      fetchedRecordIndexes.push(recordIndex);
+      return records.get(`${transferId}:${recordIndex}`)?.slice();
+    },
     putRecord: async ({ bytes, recordIndex, transferId }) => {
       if (recordIndex === failPutRecordIndex)
         throw new Error("simulated crash");
@@ -125,6 +132,19 @@ const createSurface = (useDefaultIdFactories = false) => {
       removed.push(transferId);
       for (const key of [...records.keys()])
         if (key.startsWith(`${transferId}:`)) records.delete(key);
+    },
+  };
+  const revocationKey = (transferId: string, descriptorHash: Uint8Array) =>
+    `${transferId}:${Buffer.from(descriptorHash).toString("hex")}`;
+  const revocationStore: SecureTransferRevocationStore = {
+    id: "memory-revocations",
+    has: async ({ descriptorHash, transferId }) =>
+      revocations.has(revocationKey(transferId, descriptorHash)),
+    put: async ({ descriptorHash, transferId }) => {
+      const key = revocationKey(transferId, descriptorHash);
+      if (revocations.has(key)) return "exists";
+      revocations.add(key);
+      return "created";
     },
   };
   const provider: SecureTransferCryptoProvider = {
@@ -166,15 +186,18 @@ const createSurface = (useDefaultIdFactories = false) => {
       ...(useDefaultIdFactories ? {} : { receiptIdFactory: () => "receipt-1" }),
       store: receiptStore,
     },
+    revocations: revocationStore,
     store,
     ...(useDefaultIdFactories ? {} : { transferIdFactory: () => "transfer-1" }),
   });
   return {
     client,
+    fetchedRecordIndexes,
     records,
     receiptStore,
     receipts,
     removed,
+    revocations,
     setFailReceiptUpdate: (value: number | undefined) => {
       failReceiptUpdate = value;
     },
@@ -244,6 +267,134 @@ describe("secure transfer client", () => {
     expect([...staged.flatMap((bytes) => [...bytes])]).toEqual([
       1, 2, 3, 4, 5, 6, 7, 8, 9,
     ]);
+  });
+
+  test("authenticates only the records covering an exact plaintext range", async () => {
+    const surface = createSurface();
+    const descriptor = await upload(surface);
+    const staged: Uint8Array[] = [];
+    const offsets: number[] = [];
+    let committedRange: { start: number; endExclusive: number } | undefined;
+    await surface.client.downloadRange(
+      descriptor,
+      { start: 2, endExclusive: 8 },
+      {
+        abort: async () => {
+          staged.length = 0;
+        },
+        commit: async (_value, range) => {
+          committedRange = range;
+        },
+        write: async (bytes, _recordIndex, plaintextOffset) => {
+          staged.push(bytes.slice());
+          offsets.push(plaintextOffset);
+        },
+      },
+    );
+    expect(surface.fetchedRecordIndexes).toEqual([0, 1]);
+    expect(offsets).toEqual([2, 4]);
+    expect([...staged.flatMap((bytes) => [...bytes])]).toEqual([
+      3, 4, 5, 6, 7, 8,
+    ]);
+    expect(committedRange).toEqual({ start: 2, endExclusive: 8 });
+  });
+
+  test("aborts range output on authentication failure and rejects invalid ranges", async () => {
+    const surface = createSurface();
+    const descriptor = await upload(surface);
+    surface.records.get("transfer-1:1")![0] = 9;
+    let aborted = 0;
+    let committed = false;
+    const sink = {
+      abort: async () => {
+        aborted += 1;
+      },
+      commit: async () => {
+        committed = true;
+      },
+      write: async () => undefined,
+    };
+    await expect(
+      surface.client.downloadRange(
+        descriptor,
+        { start: 3, endExclusive: 6 },
+        sink,
+      ),
+    ).rejects.toThrow("context mismatch");
+    await expect(
+      surface.client.downloadRange(
+        descriptor,
+        { start: 4, endExclusive: 4 },
+        sink,
+      ),
+    ).rejects.toThrow("non-empty");
+    await expect(
+      surface.client.downloadRange(
+        descriptor,
+        { start: 8, endExclusive: 10 },
+        sink,
+      ),
+    ).rejects.toThrow("within the plaintext");
+    expect({ aborted, committed }).toEqual({ aborted: 3, committed: false });
+  });
+
+  test("creates strict revocation notices and blocks future cooperating downloads", async () => {
+    const surface = createSurface();
+    const descriptor = await upload(surface);
+    const result = await surface.client.revoke({
+      descriptor,
+      reason: "member-removed",
+      revokerDeviceId: "alice-phone",
+    });
+    expect(result.ciphertextRemoved).toBe(true);
+    expect(surface.records.size).toBe(0);
+    expect(surface.revocations.size).toBe(1);
+
+    const encoded = encodeSecureTransferRevocation(result.revocation);
+    const decoded = decodeSecureTransferRevocation(encoded, 1_024);
+    expect(decoded).toEqual(result.revocation);
+    const extended = new TextEncoder().encode(
+      JSON.stringify({
+        ...JSON.parse(new TextDecoder().decode(encoded)),
+        eraseEveryCopy: true,
+      }),
+    );
+    expect(() => decodeSecureTransferRevocation(extended, 1_024)).toThrow(
+      "unknown fields",
+    );
+
+    let aborted = false;
+    await expect(
+      surface.client.download(descriptor, {
+        abort: async () => {
+          aborted = true;
+        },
+        commit: async () => undefined,
+        write: async () => undefined,
+      }),
+    ).rejects.toThrow("revoked");
+    expect(aborted).toBe(true);
+  });
+
+  test("applies only descriptor-bound revocations after caller authorization", async () => {
+    const sender = createSurface();
+    const descriptor = await upload(sender);
+    const { revocation } = await sender.client.revoke({
+      descriptor,
+      revokerDeviceId: "alice-phone",
+    });
+    const recipient = createSurface();
+    await expect(
+      recipient.client.applyRevocation({ descriptor, revocation }),
+    ).resolves.toBe("created");
+    const wrongHash = revocation.descriptorHash.slice();
+    wrongHash[0] = (wrongHash[0] ?? 0) ^ 1;
+    await expect(
+      createSurface().client.applyRevocation({
+        descriptor,
+        revocation: { ...revocation, descriptorHash: wrongHash },
+      }),
+    ).rejects.toThrow("hash does not match");
   });
 
   test("aborts a staged destination on missing or substituted records", async () => {

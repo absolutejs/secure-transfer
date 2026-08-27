@@ -15,6 +15,8 @@ export const manifest = defineManifest<{
       "send a private attachment descriptor through secure messaging",
       "detect missing reordered substituted or truncated transfer records",
       "resume an encrypted upload without reusing an AEAD nonce",
+      "download an authenticated plaintext byte range",
+      "revoke future attachment fetches with an E2EE policy tombstone",
     ],
     keywords: [
       "secure transfer",
@@ -22,6 +24,8 @@ export const manifest = defineManifest<{
       "large object",
       "record encryption",
       "untrusted storage",
+      "attachment revocation",
+      "range download",
     ],
     protocols: ["RFC 8188-inspired authenticated records"],
   },
