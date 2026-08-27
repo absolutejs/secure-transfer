@@ -14,6 +14,7 @@ export const manifest = defineManifest<{
       "stream authenticated records into an atomic destination",
       "send a private attachment descriptor through secure messaging",
       "detect missing reordered substituted or truncated transfer records",
+      "resume an encrypted upload without reusing an AEAD nonce",
     ],
     keywords: [
       "secure transfer",

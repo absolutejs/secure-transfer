@@ -1,4 +1,5 @@
 export const SECURE_TRANSFER_CONTRACT = 1 as const;
+export const SECURE_TRANSFER_UPLOAD_RECEIPT_CONTRACT = 1 as const;
 
 export type SecureTransferRecordContext = {
   readonly attachmentId: string;
@@ -109,6 +110,7 @@ export type SecureTransferClientOptions = {
   readonly policy: SecureTransferPolicy;
   readonly store: SecureTransferStore;
   readonly transferIdFactory?: () => string;
+  readonly resumable?: SecureTransferResumableOptions;
 };
 
 export type SecureTransferUploadInput = {
@@ -123,6 +125,90 @@ export type SecureTransferUploadInput = {
   readonly senderDeviceId: string;
 };
 
+export type SecureTransferUploadMetadata = Omit<
+  SecureTransferUploadInput,
+  "body"
+>;
+
+export type SecureTransferUploadReceipt = {
+  readonly contract: typeof SECURE_TRANSFER_UPLOAD_RECEIPT_CONTRACT;
+  readonly descriptor: SecureTransferDescriptor;
+  readonly nextRecordIndex: number;
+  /** `sealing` means encryption began but durable record creation is unconfirmed. */
+  readonly phase: "ready" | "sealing";
+};
+
+export type SecureTransferReceiptProtector = {
+  readonly id: string;
+  open(input: {
+    readonly protectedBytes: Uint8Array;
+    readonly receiptId: string;
+  }): Promise<Uint8Array>;
+  protect(input: {
+    readonly plaintext: Uint8Array;
+    readonly receiptId: string;
+  }): Promise<Uint8Array>;
+};
+
+export type SecureTransferProtectedReceiptStore = {
+  readonly id: string;
+  acquire(input: {
+    readonly leaseExpiresAt: number;
+    readonly leaseId: string;
+    readonly now: number;
+    readonly receiptId: string;
+  }): Promise<
+    | {
+        readonly protectedBytes: Uint8Array;
+        readonly status: "acquired";
+        readonly version: string;
+      }
+    | { readonly status: "busy" | "missing" }
+  >;
+  create(input: {
+    readonly expiresAt: number;
+    readonly protectedBytes: Uint8Array;
+    readonly receiptId: string;
+  }): Promise<"created" | "exists">;
+  release(input: {
+    readonly leaseId: string;
+    readonly receiptId: string;
+    readonly version: string;
+  }): Promise<void>;
+  remove(input: {
+    readonly leaseId: string;
+    readonly receiptId: string;
+    readonly version: string;
+  }): Promise<"removed" | "conflict">;
+  update(input: {
+    readonly expiresAt: number;
+    readonly leaseExpiresAt: number;
+    readonly leaseId: string;
+    readonly protectedBytes: Uint8Array;
+    readonly receiptId: string;
+    readonly version: string;
+  }): Promise<
+    | { readonly status: "conflict" }
+    | { readonly status: "updated"; readonly version: string }
+  >;
+};
+
+export type SecureTransferResumableOptions = {
+  readonly leaseDurationMs: number;
+  readonly leaseIdFactory?: () => string;
+  readonly protector: SecureTransferReceiptProtector;
+  readonly receiptIdFactory?: () => string;
+  readonly store: SecureTransferProtectedReceiptStore;
+};
+
+export type SecureTransferResumeSource = (
+  byteOffset: number,
+  remainingBytes: number,
+) =>
+  | Promise<ReadableStream<Uint8Array> | Uint8Array>
+  | ReadableStream<Uint8Array>
+  | Uint8Array;
+
 export type SecureTransferSink = {
   readonly abort: (reason: unknown) => Promise<void>;
   readonly commit: (descriptor: SecureTransferDescriptor) => Promise<void>;
@@ -130,11 +216,18 @@ export type SecureTransferSink = {
 };
 
 export type SecureTransferClient = {
+  readonly beginResumableUpload: (
+    input: SecureTransferUploadMetadata,
+  ) => Promise<{ readonly receiptId: string }>;
   readonly download: (
     descriptor: SecureTransferDescriptor,
     sink: SecureTransferSink,
   ) => Promise<void>;
   readonly remove: (descriptor: SecureTransferDescriptor) => Promise<void>;
+  readonly resumeUpload: (input: {
+    readonly receiptId: string;
+    readonly source: SecureTransferResumeSource;
+  }) => Promise<SecureTransferDescriptor>;
   readonly upload: (
     input: SecureTransferUploadInput,
   ) => Promise<SecureTransferDescriptor>;

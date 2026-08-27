@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.0
+
+- Add protected, strict resumable-upload receipts with leased compare-and-swap
+  persistence.
+- Checkpoint a `sealing` state before record encryption to prevent AEAD nonce
+  reuse after crashes or VM rollback.
+- Recover ciphertext durably written before a lost checkpoint by authenticating
+  it against the resumed source.
+- Refuse unsafe recovery when encryption may have consumed a nonce without
+  producing durable ciphertext; callers must restart with a fresh capability.
+
 ## 0.0.3
 
 - Add a bounded `SecureTransferLifecycleStore` contract for repeatable expiry

@@ -3,21 +3,115 @@ import {
   SECURE_TRANSFER_CONTRACT,
   createSecureTransferClient,
   decodeSecureTransferDescriptor,
+  decodeSecureTransferUploadReceipt,
   encodeSecureTransferDescriptor,
+  encodeSecureTransferUploadReceipt,
+  SecureTransferResumeUnsafeError,
   type SecureTransferCryptoProvider,
+  type SecureTransferProtectedReceiptStore,
+  type SecureTransferReceiptProtector,
   type SecureTransferSink,
   type SecureTransferStore,
 } from "../src";
 
 const createSurface = () => {
   let currentTime = 1_000;
+  let failPutRecordIndex: number | undefined;
   const records = new Map<string, Uint8Array>();
   const removed: string[] = [];
+  let receiptUpdate = 0;
+  let failReceiptUpdate: number | undefined;
+  const receipts = new Map<
+    string,
+    {
+      bytes: Uint8Array;
+      leaseExpiresAt?: number;
+      leaseId?: string;
+      version: number;
+    }
+  >();
+  const receiptStore: SecureTransferProtectedReceiptStore = {
+    id: "memory-receipts",
+    acquire: async ({ leaseExpiresAt, leaseId, now, receiptId }) => {
+      const value = receipts.get(receiptId);
+      if (value === undefined) return { status: "missing" };
+      if (
+        value.leaseId !== undefined &&
+        value.leaseId !== leaseId &&
+        (value.leaseExpiresAt ?? 0) > now
+      )
+        return { status: "busy" };
+      value.leaseId = leaseId;
+      value.leaseExpiresAt = leaseExpiresAt;
+      return {
+        protectedBytes: value.bytes.slice(),
+        status: "acquired",
+        version: String(value.version),
+      };
+    },
+    create: async ({ protectedBytes, receiptId }) => {
+      if (receipts.has(receiptId)) return "exists";
+      receipts.set(receiptId, { bytes: protectedBytes.slice(), version: 0 });
+      return "created";
+    },
+    release: async ({ leaseId, receiptId, version }) => {
+      const value = receipts.get(receiptId);
+      if (
+        value !== undefined &&
+        value.leaseId === leaseId &&
+        value.version === Number(version)
+      ) {
+        delete value.leaseId;
+        delete value.leaseExpiresAt;
+      }
+    },
+    remove: async ({ leaseId, receiptId, version }) => {
+      const value = receipts.get(receiptId);
+      if (
+        value === undefined ||
+        value.leaseId !== leaseId ||
+        value.version !== Number(version)
+      )
+        return "conflict";
+      receipts.delete(receiptId);
+      return "removed";
+    },
+    update: async ({
+      leaseExpiresAt,
+      leaseId,
+      protectedBytes,
+      receiptId,
+      version,
+    }) => {
+      receiptUpdate += 1;
+      const value = receipts.get(receiptId);
+      if (
+        failReceiptUpdate === receiptUpdate ||
+        value === undefined ||
+        value.leaseId !== leaseId ||
+        value.version !== Number(version)
+      )
+        return { status: "conflict" };
+      value.bytes = protectedBytes.slice();
+      value.leaseExpiresAt = leaseExpiresAt;
+      value.version += 1;
+      return { status: "updated", version: String(value.version) };
+    },
+  };
+  const receiptProtector: SecureTransferReceiptProtector = {
+    id: "xor-test-only",
+    open: async ({ protectedBytes }) =>
+      Uint8Array.from(protectedBytes, (byte) => byte ^ 0xa5),
+    protect: async ({ plaintext }) =>
+      Uint8Array.from(plaintext, (byte) => byte ^ 0xa5),
+  };
   const store: SecureTransferStore = {
     id: "memory-store",
     getRecord: async ({ recordIndex, transferId }) =>
       records.get(`${transferId}:${recordIndex}`)?.slice(),
     putRecord: async ({ bytes, recordIndex, transferId }) => {
+      if (recordIndex === failPutRecordIndex)
+        throw new Error("simulated crash");
       const key = `${transferId}:${recordIndex}`;
       if (records.has(key)) return "exists";
       records.set(key, bytes.slice());
@@ -59,13 +153,28 @@ const createSurface = () => {
       maximumRecords: 16,
       maximumTtlMs: 1_000,
     },
+    resumable: {
+      leaseDurationMs: 100,
+      leaseIdFactory: () => `lease-${receiptUpdate}`,
+      protector: receiptProtector,
+      receiptIdFactory: () => "receipt-1",
+      store: receiptStore,
+    },
     store,
     transferIdFactory: () => "transfer-1",
   });
   return {
     client,
     records,
+    receiptStore,
+    receipts,
     removed,
+    setFailReceiptUpdate: (value: number | undefined) => {
+      failReceiptUpdate = value;
+    },
+    setFailPutRecordIndex: (value: number | undefined) => {
+      failPutRecordIndex = value;
+    },
     setNow: (value: number) => {
       currentTime = value;
     },
@@ -89,6 +198,19 @@ const upload = (surface: ReturnType<typeof createSurface>) =>
     fileName: "private.bin",
     senderDeviceId: "alice-phone",
   });
+
+const resumableMetadata = {
+  attachmentId: "attachment-1",
+  byteLength: 9,
+  contentType: "application/octet-stream",
+  conversationId: "conversation-1",
+  expiresAt: 1_500,
+  fileName: "private.bin",
+  senderDeviceId: "alice-phone",
+} as const;
+
+const resumableSource = async (offset: number) =>
+  Uint8Array.of(1, 2, 3, 4, 5, 6, 7, 8, 9).slice(offset);
 
 describe("secure transfer client", () => {
   test("uploads bounded records and commits plaintext only after full authentication", async () => {
@@ -183,5 +305,97 @@ describe("secure transfer client", () => {
     ).rejects.toThrow("local policy");
     await surface.client.remove(descriptor);
     expect(surface.records.size).toBe(0);
+  });
+
+  test("persists only protected, strict resumable receipts", async () => {
+    const surface = createSurface();
+    await surface.client.beginResumableUpload(resumableMetadata);
+    const protectedBytes = surface.receipts.get("receipt-1")!.bytes;
+    expect(new TextDecoder().decode(protectedBytes)).not.toContain(
+      "private.bin",
+    );
+    const plaintext = Uint8Array.from(protectedBytes, (byte) => byte ^ 0xa5);
+    const receipt = decodeSecureTransferUploadReceipt(plaintext, 4_096, 2_048);
+    expect(receipt.nextRecordIndex).toBe(0);
+    expect(receipt.phase).toBe("ready");
+    expect(
+      decodeSecureTransferUploadReceipt(
+        encodeSecureTransferUploadReceipt(receipt),
+        4_096,
+        2_048,
+      ),
+    ).toEqual(receipt);
+    const extended = new TextEncoder().encode(
+      JSON.stringify({
+        ...JSON.parse(
+          new TextDecoder().decode(encodeSecureTransferUploadReceipt(receipt)),
+        ),
+        capability: "smuggled",
+      }),
+    );
+    expect(() =>
+      decodeSecureTransferUploadReceipt(extended, 4_096, 2_048),
+    ).toThrow("unknown fields");
+  });
+
+  test("recovers after ciphertext creation but before its receipt checkpoint", async () => {
+    const surface = createSurface();
+    await surface.client.beginResumableUpload(resumableMetadata);
+    surface.setFailReceiptUpdate(2);
+    await expect(
+      surface.client.resumeUpload({
+        receiptId: "receipt-1",
+        source: resumableSource,
+      }),
+    ).rejects.toThrow("checkpoint");
+    expect(surface.records.has("transfer-1:0")).toBe(true);
+
+    surface.setFailReceiptUpdate(undefined);
+    const descriptor = await surface.client.resumeUpload({
+      receiptId: "receipt-1",
+      source: resumableSource,
+    });
+    expect(descriptor.recordCount).toBe(3);
+    expect(surface.receipts.has("receipt-1")).toBe(false);
+    expect(surface.records.size).toBe(3);
+  });
+
+  test("refuses nonce reuse when encryption may have run without durable ciphertext", async () => {
+    const surface = createSurface();
+    await surface.client.beginResumableUpload(resumableMetadata);
+    surface.setFailPutRecordIndex(0);
+    await expect(
+      surface.client.resumeUpload({
+        receiptId: "receipt-1",
+        source: resumableSource,
+      }),
+    ).rejects.toThrow("simulated crash");
+    surface.setFailPutRecordIndex(undefined);
+    await expect(
+      surface.client.resumeUpload({
+        receiptId: "receipt-1",
+        source: resumableSource,
+      }),
+    ).rejects.toBeInstanceOf(SecureTransferResumeUnsafeError);
+    expect(surface.records.size).toBe(0);
+  });
+
+  test("rejects concurrent resumptions while a receipt lease is live", async () => {
+    const surface = createSurface();
+    await surface.client.beginResumableUpload(resumableMetadata);
+    expect(
+      await surface.receiptStore.acquire({
+        leaseExpiresAt: 1_050,
+        leaseId: "other-agent",
+        now: 1_000,
+        receiptId: "receipt-1",
+      }),
+    ).toMatchObject({ status: "acquired" });
+    await expect(
+      surface.client.resumeUpload({
+        receiptId: "receipt-1",
+        source: resumableSource,
+      }),
+    ).rejects.toThrow("already leased");
   });
 });

@@ -1,16 +1,24 @@
-import { encodeSecureTransferDescriptor } from "./codec";
+import {
+  decodeSecureTransferUploadReceipt,
+  encodeSecureTransferDescriptor,
+  encodeSecureTransferUploadReceipt,
+} from "./codec";
 import {
   SecureTransferConfigurationError,
   SecureTransferProtocolError,
+  SecureTransferResumeUnsafeError,
 } from "./errors";
 import {
   SECURE_TRANSFER_CONTRACT,
+  SECURE_TRANSFER_UPLOAD_RECEIPT_CONTRACT,
   type SecureTransferClient,
   type SecureTransferClientOptions,
   type SecureTransferDescriptor,
   type SecureTransferPolicy,
   type SecureTransferRecordContext,
   type SecureTransferUploadInput,
+  type SecureTransferUploadMetadata,
+  type SecureTransferUploadReceipt,
 } from "./types";
 
 const positiveInteger = (value: number): boolean =>
@@ -43,6 +51,14 @@ const metadataBytes = (...values: readonly (string | undefined)[]): number =>
 const requireText = (value: string, field: string): void => {
   if (value.trim().length === 0)
     throw new SecureTransferProtocolError(`${field} must not be empty.`);
+};
+
+const equalBytes = (left: Uint8Array, right: Uint8Array): boolean => {
+  let difference = left.length ^ right.length;
+  const length = Math.max(left.length, right.length);
+  for (let index = 0; index < length; index += 1)
+    difference |= (left[index] ?? 0) ^ (right[index] ?? 0);
+  return difference === 0;
 };
 
 const createContext = (
@@ -141,6 +157,33 @@ export const createSecureTransferClient = (
     );
   const now = options.now ?? Date.now;
   const transferIdFactory = options.transferIdFactory ?? crypto.randomUUID;
+  const resumable = options.resumable;
+  if (resumable !== undefined) {
+    requireText(resumable.protector.id, "receipt protector id");
+    requireText(resumable.store.id, "receipt store id");
+    if (
+      !positiveInteger(resumable.leaseDurationMs) ||
+      resumable.leaseDurationMs > options.policy.maximumTtlMs
+    )
+      throw new SecureTransferConfigurationError(
+        "Receipt lease duration violates transfer policy.",
+      );
+  }
+  const receiptIdFactory = resumable?.receiptIdFactory ?? crypto.randomUUID;
+  const leaseIdFactory = resumable?.leaseIdFactory ?? crypto.randomUUID;
+  const maximumReceiptBytes = options.policy.maximumDescriptorBytes * 2 + 1_024;
+  const nextLeaseExpiry = (): number => {
+    if (resumable === undefined)
+      throw new SecureTransferConfigurationError(
+        "Resumable uploads are not configured.",
+      );
+    const expiresAt = now() + resumable.leaseDurationMs;
+    if (!Number.isSafeInteger(expiresAt) || expiresAt < 1)
+      throw new SecureTransferProtocolError(
+        "Receipt lease expiry is outside the safe timestamp range.",
+      );
+    return expiresAt;
+  };
 
   const validateDescriptor = (
     descriptor: SecureTransferDescriptor,
@@ -191,9 +234,7 @@ export const createSecureTransferClient = (
       );
   };
 
-  const upload = async (
-    input: SecureTransferUploadInput,
-  ): Promise<SecureTransferDescriptor> => {
+  const prepareUpload = async (input: SecureTransferUploadMetadata) => {
     const currentTime = now();
     requireText(input.attachmentId, "attachmentId");
     requireText(input.conversationId, "conversationId");
@@ -257,6 +298,14 @@ export const createSecureTransferClient = (
       transferId,
     });
     validateDescriptor(descriptor);
+    return { capability, descriptor };
+  };
+
+  const upload = async (
+    input: SecureTransferUploadInput,
+  ): Promise<SecureTransferDescriptor> => {
+    const { capability, descriptor } = await prepareUpload(input);
+    const { recordCount, recordPlaintextBytes, transferId } = descriptor;
     let recordIndex = 0;
     let collision = false;
     try {
@@ -306,7 +355,281 @@ export const createSecureTransferClient = (
     }
   };
 
+  const requireResumable = () => {
+    if (resumable === undefined)
+      throw new SecureTransferConfigurationError(
+        "Resumable uploads require a protected receipt store and protector.",
+      );
+    return resumable;
+  };
+
+  const protectReceipt = async (
+    receiptId: string,
+    receipt: SecureTransferUploadReceipt,
+  ): Promise<Uint8Array> => {
+    const configured = requireResumable();
+    const plaintext = encodeSecureTransferUploadReceipt(receipt);
+    try {
+      if (plaintext.length > maximumReceiptBytes)
+        throw new SecureTransferProtocolError(
+          "Upload receipt exceeds the local size limit.",
+        );
+      const protectedBytes = await configured.protector.protect({
+        plaintext,
+        receiptId,
+      });
+      if (
+        protectedBytes.length === 0 ||
+        protectedBytes.length > maximumReceiptBytes * 2
+      )
+        throw new SecureTransferProtocolError(
+          "Receipt protector returned an invalid protected value.",
+        );
+      return protectedBytes;
+    } finally {
+      plaintext.fill(0);
+    }
+  };
+
+  const openReceipt = async (
+    receiptId: string,
+    protectedBytes: Uint8Array,
+  ): Promise<SecureTransferUploadReceipt> => {
+    const configured = requireResumable();
+    if (
+      protectedBytes.length === 0 ||
+      protectedBytes.length > maximumReceiptBytes * 2
+    )
+      throw new SecureTransferProtocolError(
+        "Protected upload receipt violates the local size limit.",
+      );
+    const plaintext = await configured.protector.open({
+      protectedBytes,
+      receiptId,
+    });
+    try {
+      const receipt = decodeSecureTransferUploadReceipt(
+        plaintext,
+        maximumReceiptBytes,
+        options.policy.maximumDescriptorBytes,
+      );
+      validateDescriptor(receipt.descriptor);
+      return receipt;
+    } finally {
+      plaintext.fill(0);
+    }
+  };
+
+  const beginResumableUpload = async (input: SecureTransferUploadMetadata) => {
+    const configured = requireResumable();
+    const { capability, descriptor } = await prepareUpload(input);
+    const receiptId = receiptIdFactory();
+    try {
+      requireText(receiptId, "generated receiptId");
+      if (new TextEncoder().encode(receiptId).length > 512)
+        throw new SecureTransferProtocolError(
+          "Generated receiptId exceeds 512 UTF-8 bytes.",
+        );
+      const protectedBytes = await protectReceipt(receiptId, {
+        contract: SECURE_TRANSFER_UPLOAD_RECEIPT_CONTRACT,
+        descriptor,
+        nextRecordIndex: 0,
+        phase: "ready",
+      });
+      try {
+        const result = await configured.store.create({
+          expiresAt: descriptor.expiresAt,
+          protectedBytes,
+          receiptId,
+        });
+        if (result !== "created")
+          throw new SecureTransferProtocolError(
+            "Generated upload receipt identifier collided.",
+          );
+      } finally {
+        protectedBytes.fill(0);
+      }
+      return Object.freeze({ receiptId });
+    } finally {
+      capability.bytes.fill(0);
+      descriptor.capability.bytes.fill(0);
+    }
+  };
+
+  const resumeUpload: SecureTransferClient["resumeUpload"] = async (input) => {
+    const configured = requireResumable();
+    requireText(input.receiptId, "receiptId");
+    const leaseId = leaseIdFactory();
+    requireText(leaseId, "generated leaseId");
+    const acquired = await configured.store.acquire({
+      leaseExpiresAt: nextLeaseExpiry(),
+      leaseId,
+      now: now(),
+      receiptId: input.receiptId,
+    });
+    if (acquired.status !== "acquired") {
+      if (acquired.status === "busy")
+        throw new SecureTransferProtocolError(
+          "Upload receipt is already leased by another resumer.",
+        );
+      throw new SecureTransferProtocolError("Upload receipt does not exist.");
+    }
+
+    let version = acquired.version;
+    let receipt: SecureTransferUploadReceipt | undefined;
+    let completed = false;
+    const checkpoint = async (
+      nextReceipt: SecureTransferUploadReceipt,
+    ): Promise<void> => {
+      const protectedBytes = await protectReceipt(input.receiptId, nextReceipt);
+      try {
+        const updated = await configured.store.update({
+          expiresAt: nextReceipt.descriptor.expiresAt,
+          leaseExpiresAt: nextLeaseExpiry(),
+          leaseId,
+          protectedBytes,
+          receiptId: input.receiptId,
+          version,
+        });
+        if (updated.status !== "updated")
+          throw new SecureTransferProtocolError(
+            "Upload receipt lease or version changed during checkpoint.",
+          );
+        version = updated.version;
+        receipt = nextReceipt;
+      } finally {
+        protectedBytes.fill(0);
+      }
+    };
+
+    try {
+      receipt = await openReceipt(input.receiptId, acquired.protectedBytes);
+      const descriptor = receipt.descriptor;
+      const initialRecordIndex = receipt.nextRecordIndex;
+      const byteOffset = initialRecordIndex * descriptor.recordPlaintextBytes;
+      const remainingBytes = descriptor.plaintextBytes - byteOffset;
+      const body = await input.source(byteOffset, remainingBytes);
+      let recordIndex = initialRecordIndex;
+
+      for await (const plaintext of recordsFrom(
+        body,
+        descriptor.recordPlaintextBytes,
+        remainingBytes,
+      )) {
+        const context = createContext(descriptor, recordIndex);
+        if (receipt.phase === "sealing") {
+          const existing = await options.store.getRecord({
+            recordIndex,
+            transferId: descriptor.transferId,
+          });
+          if (existing === undefined)
+            throw new SecureTransferResumeUnsafeError(
+              "Encryption may have consumed this record nonce without durable ciphertext; restart with a fresh transfer capability.",
+            );
+          if (
+            existing.length === 0 ||
+            existing.length >
+              options.cryptoProvider.maximumRecordCiphertextBytes
+          )
+            throw new SecureTransferProtocolError(
+              "Recovered ciphertext violates the provider limit.",
+            );
+          const recovered = await options.cryptoProvider.openRecord({
+            capability: descriptor.capability,
+            ciphertext: existing,
+            context,
+          });
+          if (!equalBytes(recovered, plaintext))
+            throw new SecureTransferProtocolError(
+              "Recovered ciphertext does not match the resumed source.",
+            );
+          recovered.fill(0);
+        } else {
+          const existing = await options.store.getRecord({
+            recordIndex,
+            transferId: descriptor.transferId,
+          });
+          if (existing !== undefined)
+            throw new SecureTransferProtocolError(
+              "Unexpected ciphertext collision before record encryption.",
+            );
+          await checkpoint(
+            Object.freeze({
+              ...receipt,
+              phase: "sealing",
+            }),
+          );
+          const ciphertext = await options.cryptoProvider.sealRecord({
+            capability: descriptor.capability,
+            context,
+            plaintext,
+          });
+          if (
+            ciphertext.length === 0 ||
+            ciphertext.length >
+              options.cryptoProvider.maximumRecordCiphertextBytes
+          )
+            throw new SecureTransferProtocolError(
+              "Crypto provider returned an invalid record.",
+            );
+          const stored = await options.store.putRecord({
+            bytes: ciphertext,
+            expiresAt: descriptor.expiresAt,
+            recordIndex,
+            transferId: descriptor.transferId,
+          });
+          if (stored !== "created")
+            throw new SecureTransferProtocolError(
+              "Ciphertext appeared while a resumable record lease was held.",
+            );
+        }
+
+        recordIndex += 1;
+        if (recordIndex === descriptor.recordCount) {
+          const removed = await configured.store.remove({
+            leaseId,
+            receiptId: input.receiptId,
+            version,
+          });
+          if (removed !== "removed")
+            throw new SecureTransferProtocolError(
+              "Upload receipt changed before completion.",
+            );
+          completed = true;
+        } else {
+          await checkpoint(
+            Object.freeze({
+              contract: SECURE_TRANSFER_UPLOAD_RECEIPT_CONTRACT,
+              descriptor,
+              nextRecordIndex: recordIndex,
+              phase: "ready",
+            }),
+          );
+        }
+      }
+      if (recordIndex !== descriptor.recordCount || !completed)
+        throw new SecureTransferProtocolError(
+          "Resumed upload did not produce its remaining declared records.",
+        );
+      return descriptor;
+    } catch (error) {
+      if (receipt !== undefined) receipt.descriptor.capability.bytes.fill(0);
+      throw error;
+    } finally {
+      acquired.protectedBytes.fill(0);
+      if (!completed)
+        await configured.store
+          .release({
+            leaseId,
+            receiptId: input.receiptId,
+            version,
+          })
+          .catch(() => undefined);
+    }
+  };
+
   return Object.freeze({
+    beginResumableUpload,
     download: async (descriptor, sink) => {
       try {
         validateDescriptor(descriptor);
@@ -356,6 +679,7 @@ export const createSecureTransferClient = (
       validateDescriptor(descriptor, true);
       await options.store.removeTransfer(descriptor.transferId);
     },
+    resumeUpload,
     upload,
   });
 };

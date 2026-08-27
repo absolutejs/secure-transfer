@@ -39,6 +39,41 @@ await messaging.send({
 });
 ```
 
+## Resumable uploads
+
+Configure a `SecureTransferReceiptProtector` and
+`SecureTransferProtectedReceiptStore`, then persist the initial protected receipt
+before reading the source:
+
+```ts
+const { receiptId } = await transfer.beginResumableUpload({
+  attachmentId,
+  byteLength: file.size,
+  conversationId,
+  expiresAt,
+  fileName: file.name,
+  senderDeviceId,
+});
+
+const descriptor = await transfer.resumeUpload({
+  receiptId,
+  source: (byteOffset) => file.slice(byteOffset).stream(),
+});
+```
+
+Receipts contain the transfer's bearer decryption capability. Core passes only
+protected opaque bytes to receipt storage and binds protection to `receiptId`.
+Use an authenticated protector backed by a key that is separate from object
+storage credentials. Never implement the protector as plaintext or reversible
+encoding.
+
+Receipt stores must implement atomic lease acquisition and compare-and-swap
+updates. Core checkpoints `phase: "sealing"` before invoking record encryption.
+If a crash occurs after ciphertext storage, resume authenticates that ciphertext
+against the source before advancing. If encryption might have happened but no
+ciphertext is durable, `SecureTransferResumeUnsafeError` requires a new transfer
+and capability rather than risking nonce reuse.
+
 The descriptor contains the decryption capability and sensitive metadata. It is
 plaintext until the caller protects it with `@absolutejs/secure-messaging` or an
 E2EE envelope. Never place it in object metadata, logs, URLs, push payloads, or a
@@ -64,6 +99,9 @@ normal chat message.
 This framing is inspired by [RFC 8188](https://www.rfc-editor.org/rfc/rfc8188.html),
 especially its authenticated record sequence, truncation handling, and unique
 per-record nonce requirements. It is not the RFC 8188 HTTP wire format.
+The resumable state machine follows
+[RFC 5116 section 3.1](https://www.rfc-editor.org/rfc/rfc5116.html#section-3.1),
+which calls for durable nonce checkpointing before encryption proceeds.
 
 File names and media types are untrusted display hints. Applications must enforce
 allowlists, size limits, safe download dispositions, and client-side inspection
@@ -72,10 +110,11 @@ ciphertext without deliberately changing the confidentiality boundary.
 
 ## Scope
 
-Version `0.0.1` provides upload, strict descriptor encoding, authenticated
-download, transactional sinks, cleanup, and provider/store contracts. Resumable
-upload receipts, range selection, attachment revocation, and concrete storage
-adapters remain roadmap work.
+Version `0.1.0` provides upload, strict descriptor and receipt encoding,
+authenticated download, resumable crash recovery, transactional sinks, cleanup,
+and provider/store contracts. Range selection and attachment revocation remain
+roadmap work. Concrete local and S3/R2 storage adapters live in
+[`secure-transfer-adapters`](https://github.com/absolutejs/secure-transfer-adapters).
 
 ## License
 

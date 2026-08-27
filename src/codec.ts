@@ -1,7 +1,9 @@
 import { SecureTransferProtocolError } from "./errors";
 import {
   SECURE_TRANSFER_CONTRACT,
+  SECURE_TRANSFER_UPLOAD_RECEIPT_CONTRACT,
   type SecureTransferDescriptor,
+  type SecureTransferUploadReceipt,
 } from "./types";
 
 const base64url = (bytes: Uint8Array): string => {
@@ -168,5 +170,65 @@ export const decodeSecureTransferDescriptor = (
     senderDeviceId: value.senderDeviceId,
     storeId: value.storeId,
     transferId: value.transferId,
+  });
+};
+
+export const encodeSecureTransferUploadReceipt = (
+  receipt: SecureTransferUploadReceipt,
+): Uint8Array =>
+  new TextEncoder().encode(
+    JSON.stringify({
+      contract: receipt.contract,
+      descriptor: base64url(encodeSecureTransferDescriptor(receipt.descriptor)),
+      nextRecordIndex: receipt.nextRecordIndex,
+      phase: receipt.phase,
+    }),
+  );
+
+export const decodeSecureTransferUploadReceipt = (
+  bytes: Uint8Array,
+  maximumBytes: number,
+  maximumDescriptorBytes: number,
+): SecureTransferUploadReceipt => {
+  if (
+    !Number.isSafeInteger(maximumBytes) ||
+    maximumBytes < 1 ||
+    bytes.length === 0 ||
+    bytes.length > maximumBytes
+  )
+    throw new SecureTransferProtocolError(
+      "Upload receipt violates the encoded size limit.",
+    );
+  let value: unknown;
+  try {
+    value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+  } catch {
+    throw new SecureTransferProtocolError("Upload receipt is not valid JSON.");
+  }
+  if (
+    !isRecord(value) ||
+    !exactKeys(value, ["contract", "descriptor", "nextRecordIndex", "phase"]) ||
+    value.contract !== SECURE_TRANSFER_UPLOAD_RECEIPT_CONTRACT ||
+    typeof value.descriptor !== "string" ||
+    !Number.isSafeInteger(value.nextRecordIndex) ||
+    Number(value.nextRecordIndex) < 0 ||
+    (value.phase !== "ready" && value.phase !== "sealing")
+  )
+    throw new SecureTransferProtocolError(
+      "Upload receipt shape is invalid or contains unknown fields.",
+    );
+  const descriptor = decodeSecureTransferDescriptor(
+    fromBase64url(value.descriptor),
+    maximumDescriptorBytes,
+  );
+  if (Number(value.nextRecordIndex) >= descriptor.recordCount)
+    throw new SecureTransferProtocolError(
+      "Upload receipt record position is outside the transfer.",
+    );
+  return Object.freeze({
+    contract: SECURE_TRANSFER_UPLOAD_RECEIPT_CONTRACT,
+    descriptor,
+    nextRecordIndex: Number(value.nextRecordIndex),
+    phase: value.phase,
   });
 };
