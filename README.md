@@ -56,8 +56,10 @@ normal chat message.
 - Downloads target a staging sink. `commit()` occurs only after every record is
   authenticated; failure calls `abort()` so partial plaintext is not mistaken for
   a complete file.
-- Upload failure makes a best-effort ciphertext cleanup. Stores still need an
-  expiry lifecycle for crash-orphaned records.
+- Upload failure makes a best-effort ciphertext cleanup. Production adapters
+  should implement `SecureTransferLifecycleStore` and run bounded expiry sweeps
+  repeatedly with the returned `cursor` until `truncated` is false so live
+  records at the start of a listing cannot starve crash-orphan cleanup.
 
 This framing is inspired by [RFC 8188](https://www.rfc-editor.org/rfc/rfc8188.html),
 especially its authenticated record sequence, truncation handling, and unique

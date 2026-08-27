@@ -51,6 +51,31 @@ export type SecureTransferStore = {
   removeTransfer(transferId: string): Promise<void>;
 };
 
+export type SecureTransferExpirySweepInput = {
+  /** Opaque continuation returned by the previous bounded sweep. */
+  readonly cursor?: string;
+  /** Delete records whose storage expiry is at or before this time. */
+  readonly expiresAtOrBefore: number;
+  /** Bound provider work performed by one repeatable sweep. */
+  readonly maximumRecords: number;
+};
+
+export type SecureTransferExpirySweepResult = {
+  /** Pass this to the next sweep when `truncated` is true. */
+  readonly cursor?: string;
+  readonly examinedRecords: number;
+  readonly removedRecords: number;
+  /** Continue sweeping until this is false. */
+  readonly truncated: boolean;
+};
+
+/** Optional lifecycle capability implemented by production storage adapters. */
+export type SecureTransferLifecycleStore = SecureTransferStore & {
+  sweepExpired(
+    input: SecureTransferExpirySweepInput,
+  ): Promise<SecureTransferExpirySweepResult>;
+};
+
 export type SecureTransferDescriptor = {
   readonly attachmentId: string;
   readonly capability: SecureTransferCapability;

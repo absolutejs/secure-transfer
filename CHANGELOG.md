@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.0.3
+
+- Add a bounded `SecureTransferLifecycleStore` contract for repeatable expiry
+  sweeps of crash-orphaned ciphertext.
+
 ## 0.0.2
 
 - Allow authenticated descriptor cleanup after transfer expiry while retaining
