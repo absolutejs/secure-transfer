@@ -156,7 +156,8 @@ export const createSecureTransferClient = (
       "Transfer record limit exceeds the crypto provider limit.",
     );
   const now = options.now ?? Date.now;
-  const transferIdFactory = options.transferIdFactory ?? crypto.randomUUID;
+  const transferIdFactory =
+    options.transferIdFactory ?? (() => crypto.randomUUID());
   const resumable = options.resumable;
   if (resumable !== undefined) {
     requireText(resumable.protector.id, "receipt protector id");
@@ -169,8 +170,10 @@ export const createSecureTransferClient = (
         "Receipt lease duration violates transfer policy.",
       );
   }
-  const receiptIdFactory = resumable?.receiptIdFactory ?? crypto.randomUUID;
-  const leaseIdFactory = resumable?.leaseIdFactory ?? crypto.randomUUID;
+  const receiptIdFactory =
+    resumable?.receiptIdFactory ?? (() => crypto.randomUUID());
+  const leaseIdFactory =
+    resumable?.leaseIdFactory ?? (() => crypto.randomUUID());
   const maximumReceiptBytes = options.policy.maximumDescriptorBytes * 2 + 1_024;
   const nextLeaseExpiry = (): number => {
     if (resumable === undefined)

@@ -14,7 +14,7 @@ import {
   type SecureTransferStore,
 } from "../src";
 
-const createSurface = () => {
+const createSurface = (useDefaultIdFactories = false) => {
   let currentTime = 1_000;
   let failPutRecordIndex: number | undefined;
   const records = new Map<string, Uint8Array>();
@@ -159,13 +159,15 @@ const createSurface = () => {
     },
     resumable: {
       leaseDurationMs: 100,
-      leaseIdFactory: () => `lease-${receiptUpdate}`,
+      ...(useDefaultIdFactories
+        ? {}
+        : { leaseIdFactory: () => `lease-${receiptUpdate}` }),
       protector: receiptProtector,
-      receiptIdFactory: () => "receipt-1",
+      ...(useDefaultIdFactories ? {} : { receiptIdFactory: () => "receipt-1" }),
       store: receiptStore,
     },
     store,
-    transferIdFactory: () => "transfer-1",
+    ...(useDefaultIdFactories ? {} : { transferIdFactory: () => "transfer-1" }),
   });
   return {
     client,
@@ -401,5 +403,13 @@ describe("secure transfer client", () => {
         source: resumableSource,
       }),
     ).rejects.toThrow("already leased");
+  });
+
+  test("uses receiver-safe default UUID factories", async () => {
+    const surface = createSurface(true);
+    const descriptor = await upload(surface);
+    expect(descriptor.transferId).toMatch(/^[0-9a-f-]{36}$/u);
+    const handle = await surface.client.beginResumableUpload(resumableMetadata);
+    expect(handle.receiptId).toMatch(/^[0-9a-f-]{36}$/u);
   });
 });

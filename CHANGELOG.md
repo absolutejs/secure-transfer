@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.2
+
+- Preserve the Web Crypto receiver when invoking default UUID factories in Bun
+  and other runtimes with receiver-sensitive `crypto.randomUUID()` methods.
+
 ## 0.1.1
 
 - Require receipt stores to reject updates, removal, and release from expired
