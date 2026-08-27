@@ -1,0 +1,10 @@
+# Changelog
+
+## 0.0.1
+
+- Add provider-neutral record encryption and untrusted storage contracts.
+- Add bounded streaming upload with strict declared-length enforcement and
+  best-effort ciphertext cleanup.
+- Add strict capability-bearing descriptor encoding and provider/store binding.
+- Add authenticated download into transactional sinks so incomplete plaintext
+  cannot be committed as a complete object.
