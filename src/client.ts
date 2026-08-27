@@ -487,6 +487,7 @@ export const createSecureTransferClient = (
           expiresAt: nextReceipt.descriptor.expiresAt,
           leaseExpiresAt: nextLeaseExpiry(),
           leaseId,
+          now: now(),
           protectedBytes,
           receiptId: input.receiptId,
           version,
@@ -588,6 +589,7 @@ export const createSecureTransferClient = (
         if (recordIndex === descriptor.recordCount) {
           const removed = await configured.store.remove({
             leaseId,
+            now: now(),
             receiptId: input.receiptId,
             version,
           });
@@ -621,6 +623,7 @@ export const createSecureTransferClient = (
         await configured.store
           .release({
             leaseId,
+            now: now(),
             receiptId: input.receiptId,
             version,
           })

@@ -172,11 +172,13 @@ export type SecureTransferProtectedReceiptStore = {
   }): Promise<"created" | "exists">;
   release(input: {
     readonly leaseId: string;
+    readonly now: number;
     readonly receiptId: string;
     readonly version: string;
   }): Promise<void>;
   remove(input: {
     readonly leaseId: string;
+    readonly now: number;
     readonly receiptId: string;
     readonly version: string;
   }): Promise<"removed" | "conflict">;
@@ -184,6 +186,7 @@ export type SecureTransferProtectedReceiptStore = {
     readonly expiresAt: number;
     readonly leaseExpiresAt: number;
     readonly leaseId: string;
+    readonly now: number;
     readonly protectedBytes: Uint8Array;
     readonly receiptId: string;
     readonly version: string;
@@ -192,6 +195,26 @@ export type SecureTransferProtectedReceiptStore = {
     | { readonly status: "updated"; readonly version: string }
   >;
 };
+
+export type SecureTransferReceiptExpirySweepInput = {
+  readonly cursor?: string;
+  readonly expiresAtOrBefore: number;
+  readonly maximumReceipts: number;
+};
+
+export type SecureTransferReceiptExpirySweepResult = {
+  readonly cursor?: string;
+  readonly examinedReceipts: number;
+  readonly removedReceipts: number;
+  readonly truncated: boolean;
+};
+
+export type SecureTransferProtectedReceiptLifecycleStore =
+  SecureTransferProtectedReceiptStore & {
+    sweepExpiredReceipts(
+      input: SecureTransferReceiptExpirySweepInput,
+    ): Promise<SecureTransferReceiptExpirySweepResult>;
+  };
 
 export type SecureTransferResumableOptions = {
   readonly leaseDurationMs: number;

@@ -73,6 +73,9 @@ If a crash occurs after ciphertext storage, resume authenticates that ciphertext
 against the source before advancing. If encryption might have happened but no
 ciphertext is durable, `SecureTransferResumeUnsafeError` requires a new transfer
 and capability rather than risking nonce reuse.
+Receipt adapters should implement
+`SecureTransferProtectedReceiptLifecycleStore`; run `sweepExpiredReceipts()`
+with its returned cursor until `truncated` is false.
 
 The descriptor contains the decryption capability and sensitive metadata. It is
 plaintext until the caller protects it with `@absolutejs/secure-messaging` or an

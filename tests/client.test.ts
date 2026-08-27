@@ -54,22 +54,24 @@ const createSurface = () => {
       receipts.set(receiptId, { bytes: protectedBytes.slice(), version: 0 });
       return "created";
     },
-    release: async ({ leaseId, receiptId, version }) => {
+    release: async ({ leaseId, now, receiptId, version }) => {
       const value = receipts.get(receiptId);
       if (
         value !== undefined &&
         value.leaseId === leaseId &&
+        (value.leaseExpiresAt ?? 0) > now &&
         value.version === Number(version)
       ) {
         delete value.leaseId;
         delete value.leaseExpiresAt;
       }
     },
-    remove: async ({ leaseId, receiptId, version }) => {
+    remove: async ({ leaseId, now, receiptId, version }) => {
       const value = receipts.get(receiptId);
       if (
         value === undefined ||
         value.leaseId !== leaseId ||
+        (value.leaseExpiresAt ?? 0) <= now ||
         value.version !== Number(version)
       )
         return "conflict";
@@ -79,6 +81,7 @@ const createSurface = () => {
     update: async ({
       leaseExpiresAt,
       leaseId,
+      now,
       protectedBytes,
       receiptId,
       version,
@@ -89,6 +92,7 @@ const createSurface = () => {
         failReceiptUpdate === receiptUpdate ||
         value === undefined ||
         value.leaseId !== leaseId ||
+        (value.leaseExpiresAt ?? 0) <= now ||
         value.version !== Number(version)
       )
         return { status: "conflict" };

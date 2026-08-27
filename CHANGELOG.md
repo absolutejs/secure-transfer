@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.1
+
+- Require receipt stores to reject updates, removal, and release from expired
+  leases using an explicit caller timestamp.
+- Add a lifecycle contract for bounded, cursor-based abandoned-receipt sweeps.
+
 ## 0.1.0
 
 - Add protected, strict resumable-upload receipts with leased compare-and-swap

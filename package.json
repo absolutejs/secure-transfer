@@ -1,6 +1,6 @@
 {
   "name": "@absolutejs/secure-transfer",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Provider-neutral encrypted, record-oriented large-object transfer for AbsoluteJS.",
   "type": "module",
   "license": "Apache-2.0",
