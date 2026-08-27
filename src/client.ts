@@ -142,7 +142,10 @@ export const createSecureTransferClient = (
   const now = options.now ?? Date.now;
   const transferIdFactory = options.transferIdFactory ?? crypto.randomUUID;
 
-  const validateDescriptor = (descriptor: SecureTransferDescriptor): void => {
+  const validateDescriptor = (
+    descriptor: SecureTransferDescriptor,
+    allowExpired = false,
+  ): void => {
     requireText(descriptor.attachmentId, "attachmentId");
     requireText(descriptor.conversationId, "conversationId");
     requireText(descriptor.senderDeviceId, "senderDeviceId");
@@ -166,7 +169,8 @@ export const createSecureTransferClient = (
         ) ||
       !Number.isSafeInteger(descriptor.createdAt) ||
       !Number.isSafeInteger(descriptor.expiresAt) ||
-      descriptor.expiresAt <= now() ||
+      descriptor.expiresAt <= descriptor.createdAt ||
+      (!allowExpired && descriptor.expiresAt <= now()) ||
       descriptor.expiresAt - descriptor.createdAt >
         options.policy.maximumTtlMs ||
       descriptor.createdAt - now() > options.policy.maximumFutureSkewMs ||
@@ -349,7 +353,7 @@ export const createSecureTransferClient = (
       }
     },
     remove: async (descriptor) => {
-      validateDescriptor(descriptor);
+      validateDescriptor(descriptor, true);
       await options.store.removeTransfer(descriptor.transferId);
     },
     upload,

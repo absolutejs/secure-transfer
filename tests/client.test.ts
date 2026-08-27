@@ -10,6 +10,7 @@ import {
 } from "../src";
 
 const createSurface = () => {
+  let currentTime = 1_000;
   const records = new Map<string, Uint8Array>();
   const removed: string[] = [];
   const store: SecureTransferStore = {
@@ -48,7 +49,7 @@ const createSurface = () => {
   };
   const client = createSecureTransferClient({
     cryptoProvider: provider,
-    now: () => 1_000,
+    now: () => currentTime,
     policy: {
       maximumAttachmentBytes: 64,
       maximumDescriptorBytes: 2_048,
@@ -61,7 +62,14 @@ const createSurface = () => {
     store,
     transferIdFactory: () => "transfer-1",
   });
-  return { client, records, removed };
+  return {
+    client,
+    records,
+    removed,
+    setNow: (value: number) => {
+      currentTime = value;
+    },
+  };
 };
 
 const upload = (surface: ReturnType<typeof createSurface>) =>
@@ -160,5 +168,20 @@ describe("secure transfer client", () => {
       "unknown fields",
     );
     expect(descriptor.contract).toBe(SECURE_TRANSFER_CONTRACT);
+  });
+
+  test("allows expired ciphertext cleanup but rejects expired download", async () => {
+    const surface = createSurface();
+    const descriptor = await upload(surface);
+    surface.setNow(2_000);
+    await expect(
+      surface.client.download(descriptor, {
+        abort: async () => undefined,
+        commit: async () => undefined,
+        write: async () => undefined,
+      }),
+    ).rejects.toThrow("local policy");
+    await surface.client.remove(descriptor);
+    expect(surface.records.size).toBe(0);
   });
 });
